@@ -11,6 +11,7 @@
 import { NextRequest } from "next/server";
 import { initDb, getDb } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
+import { reconcileProjectStages } from "@/lib/stageReconciliation";
 import {
   runInference,
   validateInsight,
@@ -45,6 +46,33 @@ const FALLBACK_INSIGHT = {
   provenance: "AI_INFERENCE" as const,
 };
 
+function buildLiveInsightFallback(
+  projectTitle: string,
+  brief: { problem?: string; target_customer?: string } | undefined,
+  evidenceItems: any[],
+  insightType: string
+) {
+  const topEv = evidenceItems.length > 0 ? evidenceItems[0] : null;
+  const statement = topEv
+    ? `Preliminary research signal: Target customers (${brief?.target_customer || "users"}) experiencing "${brief?.problem || "operational friction"}" indicate key problem patterns, noting: "${String(topEv.claim || "").slice(0, 140)}".`
+    : `Preliminary hypothesis: Target customers (${brief?.target_customer || "users"}) require a structured solution for "${brief?.problem || "the core problem"}", pending empirical customer discovery.`;
+
+  const validTypes = ["theme", "contradiction", "open_question"] as const;
+  const safeType = validTypes.includes(insightType as any) ? (insightType as (typeof validTypes)[number]) : "theme";
+
+  return {
+    statement,
+    type: safeType,
+    confidence: "low" as const,
+    evidence_for_ids: topEv ? [String(topEv.id)] : [],
+    evidence_against_ids: [],
+    caveat: topEv
+      ? `Offline synthesis fallback grounded in project problem statement and evidence [${topEv.id}]. Must be verified directly with primary customer interviews.`
+      : "Offline synthesis fallback derived from idea brief alone. Requires empirical customer evidence.",
+    provenance: "AI_INFERENCE" as const,
+  };
+}
+
 export async function POST(req: NextRequest, { params }: RouteParams) {
   try {
     await initDb();
@@ -53,13 +81,14 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
 
     // Verify project exists
     const projRes = await db.execute({
-      sql: "SELECT id, title FROM projects WHERE id = ?",
+      sql: "SELECT id, title, mode FROM projects WHERE id = ?",
       args: [id],
     });
     if (projRes.rows.length === 0) {
       return apiError("PROJECT_NOT_FOUND", `Project '${id}' not found.`, 404);
     }
-    const project = projRes.rows[0];
+    const project = projRes.rows[0] as unknown as { id: string; title: string; mode?: string };
+    const isDemoProject = id === "proj-study-planner" || project.mode === "DEMO";
 
     // Fetch brief for problem context
     const briefRes = await db.execute({
@@ -69,19 +98,30 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     const brief = briefRes.rows[0] as { problem?: string; target_customer?: string } | undefined;
 
     const body = await req.json().catch(() => ({}));
-    const insightType: string = body.insightType || "theme";
+    const rawType = String(body.insightType || "theme").trim().toLowerCase().replace(/[\s-]+/g, "_");
+    const insightType: "theme" | "contradiction" | "open_question" =
+      rawType === "contradiction" || rawType === "open_question" ? rawType : "theme";
 
     // Fetch bounded evidence context (max 8 items to keep prompt size bounded)
+    // Filter to eligible evidence under the Human Review Gate (F06: ACCEPTED or EDITED)
     const evRes = await db.execute({
       sql: `SELECT e.id, e.claim, e.excerpt, e.provenance, e.confidence, e.reviewer_status,
                    s.title as source_title, s.url as source_url, s.source_type as source_type_resolved
             FROM evidence e
             LEFT JOIN sources s ON s.id = e.source_id
-            WHERE e.project_id = ?
+            WHERE e.project_id = ? AND e.reviewer_status IN ('ACCEPTED', 'EDITED')
             ORDER BY e.created_at DESC LIMIT 8`,
       args: [id],
     });
     const evidenceItems = evRes.rows;
+
+    if (!isDemoProject && evidenceItems.length === 0) {
+      return apiError(
+        "NO_ELIGIBLE_EVIDENCE",
+        `Project '${id}' has no accepted evidence under the human review gate. Review and accept evidence before generating insights.`,
+        400
+      );
+    }
 
     const hasOnlyPlaceholders = evidenceItems.length > 0 && evidenceItems.every((e: any) => isPlaceholderEvidence(e));
 
@@ -98,6 +138,10 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     const evidenceIds = evidenceItems.map((e) => String(e.id));
 
     // Attempt Ollama inference
+    const chosenFallback = isDemoProject
+      ? FALLBACK_INSIGHT
+      : buildLiveInsightFallback(project.title, brief, evidenceItems, insightType);
+
     const outcome = await runInference({
       task: "insight-synthesis",
       systemFragment: `You are synthesizing a research insight for a product validation study.
@@ -120,30 +164,52 @@ Rules:
       userPrompt: `Evidence records:\n${evidenceContext}\n\nSynthesize one "${insightType}" insight from this evidence. Prioritize verified real evidence and supportable qualitative findings.`,
       schemaDescription: INSIGHT_SCHEMA_DESC,
       validate: validateInsight,
-      fallback: FALLBACK_INSIGHT,
-      fallbackProvenance: "SAMPLE",
+      fallback: chosenFallback,
+      fallbackProvenance: isDemoProject ? "SAMPLE" : "SIMULATED",
       temperature: 0.35,
     });
 
     const isLive = isAiInference(outcome);
-    const dbProvenance = isLive ? "AI_INFERENCE" : "SAMPLE";
+    const dbProvenance = outcome.provenance;
 
-    const evidenceForIds = isLive
-      ? (outcome.data as { evidence_for_ids: string[] }).evidence_for_ids
-      : evidenceIds;
+    // For live customer projects, offline fallbacks are not permitted to masquerade as synthesis
+    if (!isDemoProject && !isLive) {
+      const reason = (outcome as { reason?: string }).reason || "Inference failed";
+      return apiError(
+        "INFERENCE_FAILED",
+        `Ollama local inference failed for live project '${id}': ${reason}. Fallbacks are not permitted for live customer synthesis.`,
+        503,
+        true
+      );
+    }
+
+    const validEvidenceIds = new Set(evidenceItems.map((e: any) => String(e.id)));
+    let evidenceForIds = isLive
+      ? (outcome.data as { evidence_for_ids: string[] }).evidence_for_ids.filter((eid: string) => validEvidenceIds.has(eid))
+      : (chosenFallback.evidence_for_ids || evidenceIds);
+    if (evidenceForIds.length === 0 && evidenceItems.length > 0) {
+      evidenceForIds = evidenceItems.map((e: any) => String(e.id));
+    }
     const evidenceAgainstIds = isLive
-      ? (outcome.data as { evidence_against_ids: string[] }).evidence_against_ids
+      ? (outcome.data as { evidence_against_ids: string[] }).evidence_against_ids.filter((eid: string) => validEvidenceIds.has(eid))
       : [];
 
-    const isPlaceholder =
-      !isLive ||
-      hasOnlyPlaceholders ||
-      isPlaceholderBackedInsight({
-        provenance: dbProvenance,
-        evidence_for_ids: evidenceForIds,
-        statement: outcome.data.statement,
-        caveat: outcome.data.caveat,
-      });
+    const isPlaceholder = isDemoProject
+      ? (!isLive ||
+         hasOnlyPlaceholders ||
+         isPlaceholderBackedInsight({
+           provenance: dbProvenance,
+           evidence_for_ids: evidenceForIds,
+           statement: outcome.data.statement,
+           caveat: outcome.data.caveat,
+         }))
+      : (hasOnlyPlaceholders ||
+         isPlaceholderBackedInsight({
+           provenance: dbProvenance,
+           evidence_for_ids: evidenceForIds,
+           statement: outcome.data.statement,
+           caveat: outcome.data.caveat,
+         }));
 
     const sanitizedStatement = sanitizeInsightStatement(outcome.data.statement, isPlaceholder);
     const rawConf = String(outcome.data.confidence || "Medium").toLowerCase();
@@ -204,14 +270,17 @@ Rules:
           sanitizedStatement,
           outcome.data.type,
           dbConfidence,
-          JSON.stringify(isLive ? (outcome.data as { evidence_for_ids: string[] }).evidence_for_ids : evidenceIds),
-          JSON.stringify(isLive ? (outcome.data as { evidence_against_ids: string[] }).evidence_against_ids : []),
+          JSON.stringify(evidenceForIds),
+          JSON.stringify(evidenceAgainstIds),
           dbCaveat,
           dbProvenance,
           now,
         ],
       });
     }
+
+    // Reconcile insights stage (Phase 3J)
+    await reconcileProjectStages(id);
 
     return apiSuccess({
       insight: {

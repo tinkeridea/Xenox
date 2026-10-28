@@ -1,6 +1,8 @@
 import { NextRequest } from "next/server";
 import { initDb, getDb, nowUtc, PROVENANCE_ENUM } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
+import { delegateToFastAPI } from "@/lib/fastapiProxy";
+import { reconcileProjectStages } from "@/lib/stageReconciliation";
 import {
   isPlaceholderEvidence,
   isPlaceholderSource,
@@ -13,56 +15,65 @@ interface RouteParams {
   params: Promise<{ id: string }>;
 }
 
-// GET /api/projects/[id]/evidence — List all evidence and sources
+/**
+ * ROLLBACK PATH: Original TypeScript SQLite GET implementation.
+ * To rollback Slice 1Y delegation back to direct TypeScript execution:
+ * Replace `return await delegateToFastAPI(...)` in GET with `return getEvidenceFromDb(id);`
+ */
+export async function getEvidenceFromDb(id: string) {
+  await initDb();
+  const db = getDb();
+
+  const sourcesRes = await db.execute({
+    sql: `SELECT s.*,
+            (SELECT COUNT(*) FROM evidence e WHERE e.source_id = s.id) as linked_evidence_count
+          FROM sources s
+          WHERE s.project_id = ?
+          ORDER BY s.created_at ASC`,
+    args: [id],
+  });
+
+  const evidenceRes = await db.execute({
+    sql: `SELECT e.*, s.title as source_title, s.url as source_url, s.source_type as source_type_resolved
+          FROM evidence e
+          LEFT JOIN sources s ON s.id = e.source_id
+          WHERE e.project_id = ?
+          ORDER BY e.created_at ASC`,
+    args: [id],
+  });
+
+  const evidenceRows = evidenceRes.rows;
+  const sourcesRows = sourcesRes.rows;
+
+  const verifiedRealCount = evidenceRows.filter((e: any) => isVerifiedRealEvidence(e)).length;
+  const samplePlaceholderCount = evidenceRows.filter((e: any) => isPlaceholderEvidence(e)).length;
+  const unreviewedCount = evidenceRows.filter((e: any) => (e.reviewer_status || "").toUpperCase() === "UNREVIEWED").length;
+  const acceptedCount = evidenceRows.filter((e: any) => (e.reviewer_status || "").toUpperCase() === "ACCEPTED").length;
+
+  return apiSuccess({
+    projectId: id,
+    sources: sourcesRows,
+    evidence: evidenceRows,
+    metrics: {
+      totalEvidence: evidenceRows.length,
+      verifiedRealCount,
+      samplePlaceholderCount,
+      unreviewedCount,
+      acceptedCount,
+      hasUnverifiedPlaceholders: samplePlaceholderCount > 0,
+    },
+  });
+}
+
+// GET /api/projects/[id]/evidence — List all evidence and sources (Delegated to FastAPI via Slice 1Y)
 export async function GET(req: NextRequest, { params }: RouteParams) {
   try {
-    await initDb();
     const { id } = await params;
-    const db = getDb();
-
-    const sourcesRes = await db.execute({
-      sql: `SELECT s.*,
-              (SELECT COUNT(*) FROM evidence e WHERE e.source_id = s.id) as linked_evidence_count
-            FROM sources s
-            WHERE s.project_id = ?
-            ORDER BY s.created_at ASC`,
-      args: [id],
-    });
-
-    const evidenceRes = await db.execute({
-      sql: `SELECT e.*, s.title as source_title, s.url as source_url, s.source_type as source_type_resolved
-            FROM evidence e
-            LEFT JOIN sources s ON s.id = e.source_id
-            WHERE e.project_id = ?
-            ORDER BY e.created_at ASC`,
-      args: [id],
-    });
-
-    const evidenceRows = evidenceRes.rows;
-    const sourcesRows = sourcesRes.rows;
-
-    const verifiedRealCount = evidenceRows.filter((e: any) => isVerifiedRealEvidence(e)).length;
-    const samplePlaceholderCount = evidenceRows.filter((e: any) => isPlaceholderEvidence(e)).length;
-    const unreviewedCount = evidenceRows.filter((e: any) => (e.reviewer_status || "").toUpperCase() === "UNREVIEWED").length;
-    const acceptedCount = evidenceRows.filter((e: any) => (e.reviewer_status || "").toUpperCase() === "ACCEPTED").length;
-
-    return apiSuccess({
-      projectId: id,
-      sources: sourcesRows,
-      evidence: evidenceRows,
-      metrics: {
-        totalEvidence: evidenceRows.length,
-        verifiedRealCount,
-        samplePlaceholderCount,
-        unreviewedCount,
-        acceptedCount,
-        hasUnverifiedPlaceholders: samplePlaceholderCount > 0,
-      },
-    });
+    return await delegateToFastAPI(req, `/api/projects/${encodeURIComponent(id)}/evidence`);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error("GET /api/projects/[id]/evidence error:", msg);
-    return apiError("DB_QUERY_FAILED", msg, 500);
+    return apiError("INTERNAL_ERROR", "Failed to retrieve project evidence.", 500);
   }
 }
 
@@ -89,7 +100,8 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     }
 
     const excerpt = typeof body.excerpt === "string" && body.excerpt.trim() ? body.excerpt.trim() : null;
-    const sourceId = typeof body.sourceId === "string" && body.sourceId.trim() ? body.sourceId.trim() : null;
+    const rawSourceId = body.sourceId ?? body.source_id;
+    const sourceId = typeof rawSourceId === "string" && rawSourceId.trim() ? rawSourceId.trim() : null;
     
     // Validate source exists if sourceId provided
     let sourceMeta: any = null;
@@ -120,8 +132,9 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
 
     // Reviewer status (F06: default UNREVIEWED)
     const validReviewerStatuses = ["UNREVIEWED", "ACCEPTED", "EDITED", "REJECTED"];
-    const reviewerStatus = validReviewerStatuses.includes(body.reviewerStatus)
-      ? body.reviewerStatus
+    const rawReviewerStatus = (body.reviewerStatus || body.reviewer_status || "").toUpperCase();
+    const reviewerStatus = validReviewerStatuses.includes(rawReviewerStatus)
+      ? rawReviewerStatus
       : "UNREVIEWED";
 
     let caveat = typeof body.caveat === "string" && body.caveat.trim() ? body.caveat.trim() : null;
@@ -144,6 +157,9 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       args: [evidenceId, id, sourceId, claim, excerpt, provenance, confidence, reviewerStatus, caveat, now],
     });
+
+    // Reconcile research stage with new evidence (Phase 3J)
+    await reconcileProjectStages(id);
 
     const createdEvidence = {
       id: evidenceId,
@@ -209,8 +225,9 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
 
     // Allowed updates: reviewer_status, claim, excerpt, confidence, caveat
     const validReviewerStatuses = ["UNREVIEWED", "ACCEPTED", "EDITED", "REJECTED"];
-    const reviewerStatus = body.reviewerStatus && validReviewerStatuses.includes(body.reviewerStatus)
-      ? body.reviewerStatus
+    const incomingStatus = (body.reviewerStatus || body.reviewer_status || "").toUpperCase();
+    const reviewerStatus = incomingStatus && validReviewerStatuses.includes(incomingStatus)
+      ? incomingStatus
       : (current.reviewer_status as string);
 
     const claim = typeof body.claim === "string" && body.claim.trim()
@@ -244,6 +261,9 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
             WHERE id = ? AND project_id = ?`,
       args: [claim, excerpt, reviewerStatus, confidence, caveat, evidenceId, id],
     });
+
+    // Reconcile stage progression (Phase 3J)
+    await reconcileProjectStages(id);
 
     const updatedRes = await db.execute({
       sql: `SELECT e.*, s.title as source_title, s.url as source_url

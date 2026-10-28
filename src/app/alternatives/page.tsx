@@ -1,8 +1,21 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, Suspense } from "react";
 import Link from "next/link";
-import { ProvenanceBadge, FixtureBadge } from "@/components/Badges";
+import { ProvenanceBadge } from "@/components/Badges";
+import { useActiveProjectId, useActiveProjectMode, buildProjectPath } from "@/lib/useActiveProject";
+import {
+  formatCompetitorCategory,
+  isDifferentiated,
+  getDifferentiationMetrics,
+  buildDifferentiationMarkdownTable,
+} from "@/lib/competitorValidation";
+import {
+  generateCompetitorCsv,
+  generateCompetitorJson,
+  downloadFile,
+  sanitizeFilename,
+} from "@/lib/exportUtils";
 import type { CompetitorCategory } from "@/types";
 
 interface CompetitorRecord {
@@ -37,12 +50,16 @@ const CATEGORY_BORDER: Record<CompetitorCategory, string> = {
   status_quo: "rgba(107,114,128,0.35)",
 };
 
-export default function AlternativesPage() {
-  const projectId = "proj-study-planner";
+function AlternativesContent() {
+  const projectId = useActiveProjectId();
+  const projectMode = useActiveProjectMode();
   const [competitors, setCompetitors] = useState<CompetitorRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeFilter, setActiveFilter] = useState<string>("All");
+  const [viewMode, setViewMode] = useState<"grid" | "cards">("grid");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [copyToast, setCopyToast] = useState<string | null>(null);
 
   // Modals state
   const [showAddModal, setShowAddModal] = useState(false);
@@ -185,10 +202,59 @@ export default function AlternativesPage() {
     }
   };
 
+  const handleCopyMatrix = () => {
+    const tableMd = buildDifferentiationMarkdownTable(competitors);
+    if (typeof navigator !== "undefined" && navigator.clipboard) {
+      navigator.clipboard.writeText(tableMd);
+      setCopyToast("✓ Differentiation Matrix copied to clipboard");
+      setTimeout(() => setCopyToast(null), 2500);
+    }
+  };
+
+  const handleExportCsv = () => {
+    const csv = generateCompetitorCsv(competitors, projectId);
+    const filename = `ideaprobe-competitor-differentiation-${sanitizeFilename(projectId)}.csv`;
+    downloadFile(csv, filename, "text/csv;charset=utf-8;");
+    setCopyToast("✓ Competitor matrix exported as CSV");
+    setTimeout(() => setCopyToast(null), 2500);
+  };
+
+  const handleExportJson = () => {
+    const jsonObj = generateCompetitorJson(competitors, {
+      projectId,
+      mode: projectMode,
+    });
+    const filename = `ideaprobe-competitor-differentiation-${sanitizeFilename(projectId)}.json`;
+    downloadFile(JSON.stringify(jsonObj, null, 2), filename, "application/json;charset=utf-8;");
+    setCopyToast("✓ Competitor matrix exported as JSON");
+    setTimeout(() => setCopyToast(null), 2500);
+  };
+
+  const diffMetrics = getDifferentiationMetrics(competitors);
   const categories: string[] = ["All", "direct", "indirect", "substitute", "status_quo"];
-  const filtered = activeFilter === "All"
-    ? competitors
-    : competitors.filter((c) => c.category === activeFilter);
+
+  const filtered = competitors.filter((c) => {
+    // Gap / category filter
+    if (activeFilter === "gaps") {
+      if (isDifferentiated(c)) return false;
+    } else if (activeFilter !== "All") {
+      if (c.category !== activeFilter) return false;
+    }
+
+    // Search query filter
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase().trim();
+      const matchName = (c.name || "").toLowerCase().includes(q);
+      const matchDesc = (c.description || "").toLowerCase().includes(q);
+      const matchDiff = (c.differentiator || "").toLowerCase().includes(q);
+      const matchCat =
+        (c.category || "").toLowerCase().includes(q) ||
+        formatCompetitorCategory(c.category).toLowerCase().includes(q);
+      if (!matchName && !matchDesc && !matchDiff && !matchCat) return false;
+    }
+
+    return true;
+  });
 
   const countByCategory: Record<CompetitorCategory, number> = {
     direct: competitors.filter((c) => c.category === "direct").length,
@@ -205,7 +271,7 @@ export default function AlternativesPage() {
           <div className="flex items-center gap-2 mb-2" style={{ fontSize: "0.8125rem", color: "var(--text-muted)" }}>
             <Link href="/" style={{ color: "var(--text-muted)", textDecoration: "none" }}>Dashboard</Link>
             <span>/</span>
-            <Link href="/overview" style={{ color: "var(--text-muted)", textDecoration: "none" }}>Study Planner</Link>
+            <Link href={buildProjectPath("/overview", projectId)} style={{ color: "var(--text-muted)", textDecoration: "none" }}>Project Overview</Link>
             <span>/</span>
             <span style={{ color: "var(--color-accent-light)" }}>Alternatives</span>
           </div>
@@ -216,7 +282,7 @@ export default function AlternativesPage() {
             <span className="badge badge-accent" style={{ fontSize: "0.75rem" }}>SQLite Live</span>
           </div>
           <p style={{ color: "var(--text-secondary)", marginTop: "var(--space-1)", fontSize: "0.9rem" }}>
-            Direct, indirect, substitute, and status-quo alternatives the customer might choose instead.
+            Direct, indirect, substitute, and status-quo alternatives mapped against our falsifiable differentiation hypothesis.
           </p>
         </div>
         <div className="flex gap-2">
@@ -242,7 +308,144 @@ export default function AlternativesPage() {
         </div>
       )}
 
-      {/* Summary grid */}
+      {/* Differentiation Coverage Metric Bar */}
+      <div
+        className="card mb-6"
+        style={{
+          padding: "var(--space-4) var(--space-5)",
+          background: "linear-gradient(135deg, rgba(99,102,241,0.06) 0%, rgba(139,92,246,0.06) 100%)",
+          border: "1px solid rgba(99,102,241,0.22)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          flexWrap: "wrap",
+          gap: "var(--space-4)",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: "var(--space-5)", flexWrap: "wrap" }}>
+          <div>
+            <div style={{ fontSize: "0.75rem", textTransform: "uppercase", letterSpacing: "0.5px", color: "var(--text-muted)", fontWeight: 600 }}>
+              Total Alternatives
+            </div>
+            <div style={{ fontSize: "1.5rem", fontWeight: 700, color: "var(--text-primary)" }}>
+              {diffMetrics.total}
+            </div>
+          </div>
+          <div style={{ width: "1px", height: "36px", background: "var(--border-color)" }} />
+          <div>
+            <div style={{ fontSize: "0.75rem", textTransform: "uppercase", letterSpacing: "0.5px", color: "var(--text-muted)", fontWeight: 600 }}>
+              Differentiated
+            </div>
+            <div style={{ fontSize: "1.5rem", fontWeight: 700, color: "var(--color-success)" }}>
+              {diffMetrics.articulated}
+            </div>
+          </div>
+          <div style={{ width: "1px", height: "36px", background: "var(--border-color)" }} />
+          <div>
+            <div style={{ fontSize: "0.75rem", textTransform: "uppercase", letterSpacing: "0.5px", color: "var(--text-muted)", fontWeight: 600 }}>
+              Coverage
+            </div>
+            <div
+              style={{
+                fontSize: "1.5rem",
+                fontWeight: 700,
+                color:
+                  diffMetrics.coveragePercent >= 75
+                    ? "var(--color-success)"
+                    : diffMetrics.coveragePercent >= 50
+                    ? "var(--color-warning)"
+                    : "var(--color-error)",
+              }}
+            >
+              {diffMetrics.coveragePercent}%
+            </div>
+          </div>
+          <div style={{ width: "1px", height: "36px", background: "var(--border-color)" }} />
+          <div>
+            <div style={{ fontSize: "0.75rem", textTransform: "uppercase", letterSpacing: "0.5px", color: "var(--text-muted)", fontWeight: 600 }}>
+              Differentiation Gaps
+            </div>
+            <div style={{ fontSize: "1.5rem", fontWeight: 700, color: diffMetrics.gaps > 0 ? "var(--color-warning)" : "var(--text-muted)" }}>
+              {diffMetrics.gaps}
+            </div>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
+          {copyToast && (
+            <span style={{ fontSize: "0.8125rem", color: "var(--color-success)", fontWeight: 500, marginRight: "var(--space-2)" }}>
+              {copyToast}
+            </span>
+          )}
+          <button
+            id="copy-differentiation-matrix-btn"
+            className="btn btn-secondary btn-sm"
+            onClick={handleCopyMatrix}
+            title="Copy differentiation matrix as Markdown table"
+            style={{ display: "flex", alignItems: "center", gap: "6px" }}
+          >
+            <span>📋</span> Copy Matrix (.md)
+          </button>
+          <button
+            id="export-competitors-csv-btn"
+            className="btn btn-secondary btn-sm"
+            onClick={handleExportCsv}
+            title="Export competitor differentiation matrix as CSV"
+            style={{ display: "flex", alignItems: "center", gap: "6px" }}
+          >
+            <span>📥</span> Export CSV
+          </button>
+          <button
+            id="export-competitors-json-btn"
+            className="btn btn-secondary btn-sm"
+            onClick={handleExportJson}
+            title="Export competitor differentiation matrix as JSON"
+            style={{ display: "flex", alignItems: "center", gap: "6px" }}
+          >
+            <span>📥</span> Export JSON
+          </button>
+        </div>
+      </div>
+
+      {/* Differentiation Gap Warning Banner */}
+      {diffMetrics.gaps > 0 && (
+        <div
+          id="differentiation-gap-banner"
+          className="card mb-4"
+          style={{
+            padding: "var(--space-3) var(--space-4)",
+            background: "rgba(245,158,11,0.08)",
+            border: "1px solid rgba(245,158,11,0.3)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            flexWrap: "wrap",
+            gap: "var(--space-3)",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+            <span style={{ fontSize: "1.25rem" }}>⚠️</span>
+            <span style={{ fontSize: "0.875rem", color: "var(--text-primary)" }}>
+              <strong>Differentiation Gap Alert:</strong> {diffMetrics.gaps} alternative(s) do not have an articulated differentiation advantage. Without a clear differentiator, customer inertia favors existing habits.
+            </span>
+          </div>
+          <button
+            id="filter-gaps-banner-btn"
+            className="btn btn-sm"
+            style={{
+              fontSize: "0.75rem",
+              background: activeFilter === "gaps" ? "var(--color-warning)" : "transparent",
+              color: activeFilter === "gaps" ? "#000" : "var(--color-warning)",
+              border: "1px solid var(--color-warning)",
+            }}
+            onClick={() => setActiveFilter(activeFilter === "gaps" ? "All" : "gaps")}
+          >
+            {activeFilter === "gaps" ? "Show All Alternatives" : "Filter Gaps Only"}
+          </button>
+        </div>
+      )}
+
+      {/* Category Summary Cards */}
       <div className="grid-4 mb-6" style={{ gap: "var(--space-3)" }}>
         {(["direct", "indirect", "substitute", "status_quo"] as CompetitorCategory[]).map((cat) => (
           <div
@@ -267,38 +470,358 @@ export default function AlternativesPage() {
         ))}
       </div>
 
-      {/* Filter tabs */}
-      <div className="flex gap-2 mb-4" style={{ flexWrap: "wrap", alignItems: "center" }}>
-        {categories.map((cat) => (
+      {/* Controls & Filter Toolbar */}
+      <div className="flex justify-between items-center mb-4" style={{ flexWrap: "wrap", gap: "var(--space-3)" }}>
+        <div className="flex gap-2" style={{ flexWrap: "wrap", alignItems: "center" }}>
+          {categories.map((cat) => (
+            <button
+              key={cat}
+              onClick={() => setActiveFilter(cat)}
+              className={`btn btn-sm ${activeFilter === cat ? "btn-primary" : "btn-secondary"}`}
+              style={{ fontSize: "0.75rem" }}
+            >
+              {cat === "All" ? "All" : CATEGORY_LABELS[cat as CompetitorCategory] || cat} (
+              {cat === "All" ? competitors.length : countByCategory[cat as CompetitorCategory] || 0})
+            </button>
+          ))}
           <button
-            key={cat}
-            onClick={() => setActiveFilter(cat)}
-            className={`btn btn-sm ${activeFilter === cat ? "btn-primary" : "btn-secondary"}`}
-            style={{ fontSize: "0.75rem" }}
+            id="filter-gaps-btn"
+            onClick={() => setActiveFilter(activeFilter === "gaps" ? "All" : "gaps")}
+            className={`btn btn-sm ${activeFilter === "gaps" ? "btn-primary" : "btn-secondary"}`}
+            style={{ fontSize: "0.75rem", borderColor: "rgba(245,158,11,0.5)" }}
           >
-            {cat === "All" ? "All" : CATEGORY_LABELS[cat as CompetitorCategory] || cat} (
-            {cat === "All" ? competitors.length : countByCategory[cat as CompetitorCategory] || 0})
+            ⚠️ Gaps ({diffMetrics.gaps})
           </button>
-        ))}
-        <span style={{ marginLeft: "auto", fontSize: "0.8rem", color: "var(--text-muted)" }}>
-          {filtered.length} competitors shown
-        </span>
+        </div>
+
+        <div className="flex gap-3 items-center" style={{ flexWrap: "wrap" }}>
+          {/* Search Input */}
+          <div style={{ position: "relative" }}>
+            <input
+              id="competitor-search-input"
+              type="text"
+              className="input"
+              placeholder="Search alternatives or differentiator..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              style={{ fontSize: "0.8125rem", padding: "6px 28px 6px 10px", width: "240px" }}
+            />
+            {searchQuery && (
+              <button
+                onClick={() => setSearchQuery("")}
+                style={{
+                  position: "absolute",
+                  right: "8px",
+                  top: "50%",
+                  transform: "translateY(-50%)",
+                  background: "none",
+                  border: "none",
+                  color: "var(--text-muted)",
+                  cursor: "pointer",
+                  fontSize: "0.75rem",
+                }}
+              >
+                ✕
+              </button>
+            )}
+          </div>
+
+          {/* View Switcher: Grid vs Cards */}
+          <div
+            className="btn-group"
+            style={{
+              display: "inline-flex",
+              borderRadius: "var(--radius-md)",
+              border: "1px solid var(--border-color)",
+              overflow: "hidden",
+            }}
+          >
+            <button
+              id="view-grid-btn"
+              className={`btn btn-sm ${viewMode === "grid" ? "btn-primary" : "btn-secondary"}`}
+              onClick={() => setViewMode("grid")}
+              style={{ fontSize: "0.75rem", border: "none", borderRadius: 0 }}
+              title="Comparative Differentiation Grid View"
+            >
+              📊 Grid View
+            </button>
+            <button
+              id="view-cards-btn"
+              className={`btn btn-sm ${viewMode === "cards" ? "btn-primary" : "btn-secondary"}`}
+              onClick={() => setViewMode("cards")}
+              style={{ fontSize: "0.75rem", border: "none", borderRadius: 0 }}
+              title="Detailed Cards View"
+            >
+              🗂️ Cards View
+            </button>
+          </div>
+        </div>
       </div>
 
-      {/* Loading state */}
+      {/* Main Content: Loading / Empty / Grid / Cards */}
       {loading ? (
         <div className="card text-center" style={{ padding: "var(--space-8)", color: "var(--text-muted)" }}>
-          Loading competitors from SQLite database...
+          Loading alternatives from SQLite database...
         </div>
       ) : filtered.length === 0 ? (
         <div className="card text-center" style={{ padding: "var(--space-8)", color: "var(--text-muted)" }}>
-          No competitors found in this category. Click "+ Add Competitor" or "⚡ Analyze Competitor (AI)" to add one.
+          {competitors.length === 0 ? (
+            <>No competitors mapped yet. Click "+ Add Competitor" or "⚡ Analyze Competitor (AI)" to begin.</>
+          ) : (
+            <>
+              No alternatives matched your filter or search query.{" "}
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={() => {
+                  setActiveFilter("All");
+                  setSearchQuery("");
+                }}
+                style={{ marginLeft: "8px" }}
+              >
+                Reset Filters
+              </button>
+            </>
+          )}
+        </div>
+      ) : viewMode === "grid" ? (
+        /* ─── DIFFERENTIATION GRID VIEW ─────────────────────────────────────── */
+        <div
+          className="card"
+          style={{
+            padding: 0,
+            overflow: "hidden",
+            border: "1px solid var(--border-color)",
+          }}
+        >
+          <div style={{ overflowX: "auto" }}>
+            <table
+              id="differentiation-grid-table"
+              style={{
+                width: "100%",
+                borderCollapse: "collapse",
+                textAlign: "left",
+                fontSize: "0.875rem",
+              }}
+            >
+              <thead>
+                <tr
+                  style={{
+                    background: "var(--color-surface-2)",
+                    borderBottom: "1px solid var(--border-color)",
+                    color: "var(--text-muted)",
+                    fontSize: "0.75rem",
+                    textTransform: "uppercase",
+                    letterSpacing: "0.5px",
+                  }}
+                >
+                  <th style={{ padding: "var(--space-3) var(--space-4)", width: "22%" }}>Alternative</th>
+                  <th style={{ padding: "var(--space-3) var(--space-4)", width: "16%" }}>Category</th>
+                  <th style={{ padding: "var(--space-3) var(--space-4)", width: "26%" }}>Current Solution / Offer</th>
+                  <th style={{ padding: "var(--space-3) var(--space-4)", width: "26%" }}>Our Differentiation Advantage</th>
+                  <th style={{ padding: "var(--space-3) var(--space-4)", width: "10%", textAlign: "right" }}>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map((comp) => {
+                  const isEditing = editingId === comp.id;
+                  const hasDiff = isDifferentiated(comp);
+
+                  if (isEditing) {
+                    return (
+                      <tr
+                        key={comp.id}
+                        style={{
+                          background: "rgba(99,102,241,0.06)",
+                          borderBottom: "1px solid var(--border-color)",
+                        }}
+                      >
+                        <td style={{ padding: "var(--space-4)", verticalAlign: "top" }}>
+                          <div style={{ fontWeight: 600, color: "var(--text-primary)" }}>{comp.name}</div>
+                          <div style={{ marginTop: "4px" }}>
+                            <ProvenanceBadge type={comp.provenance as any} size="sm" />
+                          </div>
+                        </td>
+                        <td style={{ padding: "var(--space-4)", verticalAlign: "top" }}>
+                          <span
+                            style={{
+                              fontSize: "0.75rem",
+                              padding: "2px 8px",
+                              borderRadius: "var(--radius-sm)",
+                              background: CATEGORY_COLOR[comp.category],
+                              border: `1px solid ${CATEGORY_BORDER[comp.category]}`,
+                              color: "var(--text-secondary)",
+                            }}
+                          >
+                            {CATEGORY_LABELS[comp.category]}
+                          </span>
+                        </td>
+                        <td style={{ padding: "var(--space-4)", verticalAlign: "top" }}>
+                          <textarea
+                            id={`grid-edit-desc-${comp.id}`}
+                            className="input"
+                            rows={3}
+                            placeholder="Describe what it offers..."
+                            value={editDescription}
+                            onChange={(e) => setEditDescription(e.target.value)}
+                            style={{ width: "100%", fontSize: "0.8125rem" }}
+                          />
+                        </td>
+                        <td style={{ padding: "var(--space-4)", verticalAlign: "top" }}>
+                          <textarea
+                            id={`grid-edit-diff-${comp.id}`}
+                            className="input"
+                            rows={3}
+                            placeholder="How does IdeaProbe win or differ fundamentally?"
+                            value={editDifferentiator}
+                            onChange={(e) => setEditDifferentiator(e.target.value)}
+                            style={{ width: "100%", fontSize: "0.8125rem" }}
+                          />
+                        </td>
+                        <td style={{ padding: "var(--space-4)", verticalAlign: "top", textAlign: "right" }}>
+                          <div style={{ display: "flex", flexDirection: "column", gap: "6px", alignItems: "flex-end" }}>
+                            <button
+                              id={`grid-save-btn-${comp.id}`}
+                              className="btn btn-primary btn-sm"
+                              onClick={() => handleUpdate(comp.id)}
+                              style={{ fontSize: "0.75rem" }}
+                            >
+                              Save
+                            </button>
+                            <button
+                              id={`grid-cancel-btn-${comp.id}`}
+                              className="btn btn-secondary btn-sm"
+                              onClick={() => setEditingId(null)}
+                              style={{ fontSize: "0.75rem" }}
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  }
+
+                  return (
+                    <tr
+                      key={comp.id}
+                      style={{
+                        borderBottom: "1px solid var(--border-color)",
+                        background: !hasDiff ? "rgba(245,158,11,0.02)" : "transparent",
+                        transition: "background 0.15s ease",
+                      }}
+                    >
+                      <td style={{ padding: "var(--space-4)", verticalAlign: "top" }}>
+                        <div style={{ fontWeight: 600, color: "var(--text-primary)", fontSize: "0.9375rem" }}>
+                          {comp.name}
+                        </div>
+                        <div style={{ marginTop: "4px" }}>
+                          <ProvenanceBadge type={comp.provenance as any} size="sm" />
+                        </div>
+                      </td>
+                      <td style={{ padding: "var(--space-4)", verticalAlign: "top" }}>
+                        <span
+                          style={{
+                            fontSize: "0.75rem",
+                            padding: "2px 8px",
+                            borderRadius: "var(--radius-sm)",
+                            background: CATEGORY_COLOR[comp.category],
+                            border: `1px solid ${CATEGORY_BORDER[comp.category]}`,
+                            color: "var(--text-secondary)",
+                            display: "inline-block",
+                          }}
+                        >
+                          {CATEGORY_LABELS[comp.category]}
+                        </span>
+                      </td>
+                      <td style={{ padding: "var(--space-4)", verticalAlign: "top", color: "var(--text-secondary)", lineHeight: 1.5 }}>
+                        {comp.description || (
+                          <span style={{ color: "var(--text-muted)", fontStyle: "italic" }}>
+                            No description provided.
+                          </span>
+                        )}
+                      </td>
+                      <td style={{ padding: "var(--space-4)", verticalAlign: "top" }}>
+                        {hasDiff ? (
+                          <div
+                            style={{
+                              padding: "8px 12px",
+                              borderRadius: "var(--radius-sm)",
+                              background: "rgba(99,102,241,0.06)",
+                              border: "1px solid rgba(99,102,241,0.2)",
+                            }}
+                          >
+                            <div style={{ display: "flex", alignItems: "center", gap: "6px", marginBottom: "4px" }}>
+                              <span style={{ fontSize: "0.7rem", color: "var(--color-success)", fontWeight: 600 }}>
+                                ✓ ARTICULATED
+                              </span>
+                            </div>
+                            <div style={{ color: "var(--text-primary)", lineHeight: 1.5, fontSize: "0.85rem" }}>
+                              {comp.differentiator}
+                            </div>
+                          </div>
+                        ) : (
+                          <div
+                            style={{
+                              padding: "8px 12px",
+                              borderRadius: "var(--radius-sm)",
+                              background: "rgba(245,158,11,0.08)",
+                              border: "1px dashed rgba(245,158,11,0.35)",
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              gap: "8px",
+                            }}
+                          >
+                            <span style={{ color: "var(--color-warning)", fontSize: "0.8125rem", fontWeight: 500 }}>
+                              ⚠️ Gap — Unspecified
+                            </span>
+                            <button
+                              id={`grid-define-btn-${comp.id}`}
+                              className="btn btn-secondary btn-sm"
+                              onClick={() => startEdit(comp)}
+                              style={{ fontSize: "0.7rem", padding: "2px 8px" }}
+                            >
+                              + Define
+                            </button>
+                          </div>
+                        )}
+                      </td>
+                      <td style={{ padding: "var(--space-4)", verticalAlign: "top", textAlign: "right" }}>
+                        <div style={{ display: "flex", gap: "4px", justifyContent: "flex-end" }}>
+                          <button
+                            id={`grid-edit-btn-${comp.id}`}
+                            className="btn btn-secondary btn-sm"
+                            onClick={() => startEdit(comp)}
+                            style={{ fontSize: "0.75rem", padding: "4px 8px" }}
+                            title="Edit alternative"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            id={`grid-delete-btn-${comp.id}`}
+                            className="btn btn-secondary btn-sm"
+                            onClick={() => handleDelete(comp.id)}
+                            style={{ fontSize: "0.75rem", padding: "4px 8px", color: "var(--color-error)" }}
+                            title="Delete alternative"
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
         </div>
       ) : (
-        /* Competitor cards */
+        /* ─── CARDS VIEW ─────────────────────────────────────────────────────── */
         <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-4)" }}>
           {filtered.map((comp) => {
             const isEditing = editingId === comp.id;
+            const hasDiff = isDifferentiated(comp);
+
             return (
               <div
                 key={comp.id}
@@ -327,6 +850,15 @@ export default function AlternativesPage() {
                       {CATEGORY_LABELS[comp.category]}
                     </span>
                     <ProvenanceBadge type={comp.provenance as any} size="sm" />
+                    {hasDiff ? (
+                      <span className="badge badge-success" style={{ fontSize: "0.7rem" }}>
+                        ✓ Articulated
+                      </span>
+                    ) : (
+                      <span className="badge badge-warning" style={{ fontSize: "0.7rem" }}>
+                        ⚠️ Gap
+                      </span>
+                    )}
                   </div>
                   <div className="flex gap-2">
                     {isEditing ? (
@@ -343,7 +875,11 @@ export default function AlternativesPage() {
                         <button className="btn btn-secondary btn-sm" onClick={() => startEdit(comp)} style={{ fontSize: "0.75rem" }}>
                           Edit
                         </button>
-                        <button className="btn btn-secondary btn-sm" onClick={() => handleDelete(comp.id)} style={{ fontSize: "0.75rem", color: "var(--color-error)" }}>
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          onClick={() => handleDelete(comp.id)}
+                          style={{ fontSize: "0.75rem", color: "var(--color-error)" }}
+                        >
                           Delete
                         </button>
                       </>
@@ -388,15 +924,28 @@ export default function AlternativesPage() {
                       style={{
                         padding: "var(--space-3) var(--space-4)",
                         borderRadius: "var(--radius-md)",
-                        background: "rgba(99,102,241,0.06)",
-                        border: "1px solid rgba(99,102,241,0.18)",
+                        background: hasDiff ? "rgba(99,102,241,0.06)" : "rgba(245,158,11,0.06)",
+                        border: `1px solid ${hasDiff ? "rgba(99,102,241,0.18)" : "rgba(245,158,11,0.25)"}`,
                         fontSize: "0.875rem",
                       }}
                     >
-                      <div style={{ color: "var(--text-muted)", fontSize: "0.75rem", marginBottom: "4px", fontWeight: 600 }}>
-                        OUR DIFFERENTIATION
+                      <div
+                        style={{
+                          color: hasDiff ? "var(--color-accent-light)" : "var(--color-warning)",
+                          fontSize: "0.75rem",
+                          marginBottom: "4px",
+                          fontWeight: 600,
+                        }}
+                      >
+                        {hasDiff ? "OUR DIFFERENTIATION ADVANTAGE" : "⚠️ DIFFERENTIATION GAP"}
                       </div>
-                      <div style={{ color: "var(--text-primary)" }}>{comp.differentiator || "Not specified."}</div>
+                      <div style={{ color: "var(--text-primary)" }}>
+                        {comp.differentiator || (
+                          <span style={{ color: "var(--text-muted)", fontStyle: "italic" }}>
+                            Not specified. Click &quot;Edit&quot; to articulate how IdeaProbe wins.
+                          </span>
+                        )}
+                      </div>
                     </div>
                   </>
                 )}
@@ -406,13 +955,13 @@ export default function AlternativesPage() {
         </div>
       )}
 
-      {/* Positioning note */}
+      {/* Strategic Positioning Note */}
       <div className="card mt-6" style={{ padding: "var(--space-5)", background: "var(--color-surface-2)" }}>
         <h3 style={{ fontSize: "0.9375rem", fontWeight: "600", color: "var(--text-primary)", marginBottom: "var(--space-2)" }}>
           📌 Strategic Positioning Rule
         </h3>
         <p style={{ fontSize: "0.875rem", color: "var(--text-secondary)", lineHeight: 1.6 }}>
-          The true competitor is the <strong>paper timetable and WhatsApp group</strong> (status quo) — not competing SaaS apps. 
+          The true competitor is the <strong>paper timetable, WhatsApp group, or current habit</strong> (status quo) — not competing SaaS apps. 
           Any new tool must be adopted by habit displacement, not feature comparison. 
           Zero-friction onboarding and forgiveness-by-default design are table stakes before any feature differentiation matters.
         </p>
@@ -560,5 +1109,13 @@ export default function AlternativesPage() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function AlternativesPage() {
+  return (
+    <Suspense fallback={<div className="page-container">Loading alternatives...</div>}>
+      <AlternativesContent />
+    </Suspense>
   );
 }

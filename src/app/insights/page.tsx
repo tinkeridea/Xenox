@@ -1,8 +1,9 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, Suspense } from "react";
 import Link from "next/link";
 import { ProvenanceBadge, FixtureBadge } from "@/components/Badges";
+import { useActiveProjectId, useActiveProjectMode, buildProjectPath } from "@/lib/useActiveProject";
 import type { ProvenanceType } from "@/types";
 import { normalizeInsightStatement } from "@/lib/insightValidation";
 
@@ -23,6 +24,7 @@ interface EvidenceMapItem {
   id: string;
   claim: string;
   provenance: ProvenanceType;
+  reviewer_status?: string;
 }
 
 const TYPE_CONFIG = {
@@ -55,8 +57,9 @@ const CONFIDENCE_COLOR: Record<string, string> = {
   low: "var(--color-error)",
 };
 
-export default function InsightsPage() {
-  const [projectId] = useState("proj-study-planner");
+function InsightsContent() {
+  const projectId = useActiveProjectId();
+  const projectMode = useActiveProjectMode(projectId);
   const [insights, setInsights] = useState<InsightRow[]>([]);
   const [evidenceMap, setEvidenceMap] = useState<Record<string, EvidenceMapItem>>({});
   const [loading, setLoading] = useState(true);
@@ -78,8 +81,8 @@ export default function InsightsPage() {
     setLoading(true);
     try {
       const [insightsRes, evRes] = await Promise.all([
-        fetch(`/api/projects/${projectId}/insights`),
-        fetch(`/api/projects/${projectId}/evidence`),
+        fetch(`/api/projects/${encodeURIComponent(projectId)}/insights`),
+        fetch(`/api/projects/${encodeURIComponent(projectId)}/evidence`),
       ]);
 
       if (insightsRes.ok) {
@@ -91,7 +94,12 @@ export default function InsightsPage() {
         const eJson = await evRes.json();
         const map: Record<string, EvidenceMapItem> = {};
         for (const item of eJson.data?.evidence || []) {
-          map[item.id] = { id: item.id, claim: item.claim, provenance: item.provenance };
+          map[item.id] = {
+            id: item.id,
+            claim: item.claim,
+            provenance: item.provenance,
+            reviewer_status: item.reviewer_status,
+          };
         }
         setEvidenceMap(map);
       }
@@ -112,14 +120,16 @@ export default function InsightsPage() {
     setSynthesizing(true);
     setShowSynthesizeModal(false);
     try {
-      const res = await fetch(`/api/projects/${projectId}/insights/generate`, {
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/insights/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ insightType: selectedType }),
       });
 
       if (!res.ok) {
-        throw new Error(`Inference endpoint returned HTTP ${res.status}`);
+        const errJson = await res.json().catch(() => null);
+        const errMsg = errJson?.error?.message || `Inference endpoint returned HTTP ${res.status}`;
+        throw new Error(errMsg);
       }
 
       const json = await res.json();
@@ -148,6 +158,10 @@ export default function InsightsPage() {
     }
   };
 
+  const acceptedEvidenceCount = Object.values(evidenceMap).filter(
+    (e) => e.reviewer_status === "ACCEPTED" || e.reviewer_status === "EDITED"
+  ).length;
+
   const filtered = filter === "All" ? insights : insights.filter((i) => i.type === filter);
 
   return (
@@ -158,7 +172,7 @@ export default function InsightsPage() {
           <div className="flex items-center gap-2 mb-2" style={{ fontSize: "0.8125rem", color: "var(--text-muted)" }}>
             <Link href="/" style={{ color: "var(--text-muted)", textDecoration: "none" }}>Dashboard</Link>
             <span>/</span>
-            <Link href="/overview" style={{ color: "var(--text-muted)", textDecoration: "none" }}>Study Planner</Link>
+            <Link href={buildProjectPath("/overview", projectId)} style={{ color: "var(--text-muted)", textDecoration: "none" }}>Project Overview</Link>
             <span>/</span>
             <span style={{ color: "var(--color-accent-light)" }}>Insights</span>
           </div>
@@ -166,7 +180,7 @@ export default function InsightsPage() {
             <h1 style={{ fontSize: "1.75rem", fontWeight: "700", color: "var(--text-primary)" }}>
               Insights &amp; Contradictions (F11)
             </h1>
-            <FixtureBadge />
+            <FixtureBadge mode={projectMode} />
           </div>
           <p style={{ color: "var(--text-secondary)", marginTop: "var(--space-1)", fontSize: "0.9rem" }}>
             Patterns, counter-signals, and open questions synthesized from the evidence ledger with Ollama local inference.
@@ -514,11 +528,47 @@ export default function InsightsPage() {
               </div>
             </div>
 
+            {projectMode === "LIVE" && acceptedEvidenceCount === 0 && (
+              <div
+                id="unreviewed-evidence-warning"
+                style={{
+                  padding: "var(--space-3)",
+                  borderRadius: "var(--radius-sm)",
+                  background: "rgba(245, 158, 11, 0.12)",
+                  border: "1px solid rgba(245, 158, 11, 0.35)",
+                  color: "var(--text-primary)",
+                  fontSize: "0.825rem",
+                  marginBottom: "var(--space-4)",
+                  lineHeight: 1.5,
+                }}
+              >
+                <div style={{ fontWeight: 600, color: "#f59e0b", marginBottom: "4px" }}>
+                  ⚠️ Human Review Gate: No Accepted Evidence
+                </div>
+                This project has no accepted evidence yet. In LIVE mode, IdeaProbe requires at least one reviewed and accepted evidence claim before synthesizing insights.
+                <div style={{ marginTop: "6px" }}>
+                  <Link
+                    href={buildProjectPath("/research", projectId)}
+                    style={{ color: "var(--color-accent-light)", fontWeight: 600, textDecoration: "underline" }}
+                    onClick={() => setShowSynthesizeModal(false)}
+                  >
+                    Go to Research Ledger to Review Evidence →
+                  </Link>
+                </div>
+              </div>
+            )}
+
             <div className="flex justify-end gap-2 mt-6">
               <button className="btn btn-secondary" onClick={() => setShowSynthesizeModal(false)}>
                 Cancel
               </button>
-              <button className="btn btn-primary" onClick={handleSynthesize}>
+              <button
+                className="btn btn-primary"
+                onClick={handleSynthesize}
+                disabled={synthesizing || (projectMode === "LIVE" && acceptedEvidenceCount === 0)}
+                title={projectMode === "LIVE" && acceptedEvidenceCount === 0 ? "Review and accept evidence in the Research Ledger first" : undefined}
+                id="btn-run-synthesis"
+              >
                 ⚡ Run Synthesis
               </button>
             </div>
@@ -526,5 +576,13 @@ export default function InsightsPage() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function InsightsPage() {
+  return (
+    <Suspense fallback={<div className="page-container">Loading insights...</div>}>
+      <InsightsContent />
+    </Suspense>
   );
 }

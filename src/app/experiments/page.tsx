@@ -4,6 +4,12 @@ import React, { useState, useEffect, useCallback, Suspense } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { ProvenanceBadge } from "@/components/Badges";
+import { useActiveProjectId, buildProjectPath } from "@/lib/useActiveProject";
+import {
+  evaluateExperimentDecision,
+  type ExperimentDecision,
+  type DecisionOutcome,
+} from "@/lib/experimentDecision";
 
 interface ExperimentRecord {
   id: string;
@@ -41,8 +47,32 @@ const STATUS_CONFIG: Record<string, { label: string; icon: string; color: string
   abandoned: { label: "Abandoned", icon: "❌", color: "var(--color-error)", bg: "rgba(239,68,68,0.1)" },
 };
 
+const DECISION_CONFIG: Record<DecisionOutcome, { label: string; icon: string; color: string; bg: string; border: string }> = {
+  supported: {
+    label: "Supported",
+    icon: "✅",
+    color: "var(--color-success)",
+    bg: "rgba(34,197,94,0.12)",
+    border: "rgba(34,197,94,0.3)",
+  },
+  rejected: {
+    label: "Rejected",
+    icon: "❌",
+    color: "var(--color-error)",
+    bg: "rgba(239,68,68,0.12)",
+    border: "rgba(239,68,68,0.3)",
+  },
+  inconclusive: {
+    label: "Inconclusive",
+    icon: "⚠️",
+    color: "#f59e0b",
+    bg: "rgba(245,158,11,0.12)",
+    border: "rgba(245,158,11,0.3)",
+  },
+};
+
 function ExperimentsContent() {
-  const projectId = "proj-study-planner";
+  const projectId = useActiveProjectId();
   const searchParams = useSearchParams();
   const preselectedAssumptionId = searchParams?.get("assumptionId") || "";
 
@@ -59,6 +89,7 @@ function ExperimentsContent() {
   const [generateMethod, setGenerateMethod] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
   const [generateFeedback, setGenerateFeedback] = useState<string | null>(null);
+  const [generateError, setGenerateError] = useState<string | null>(null);
 
   // Manual Add modal
   const [showAddModal, setShowAddModal] = useState(false);
@@ -126,6 +157,7 @@ function ExperimentsContent() {
     e.preventDefault();
     setIsGenerating(true);
     setGenerateFeedback(null);
+    setGenerateError(null);
     try {
       const res = await fetch(`/api/projects/${projectId}/experiments/generate`, {
         method: "POST",
@@ -150,7 +182,7 @@ function ExperimentsContent() {
         setGenerateFeedback(null);
       }, 1400);
     } catch (err: unknown) {
-      alert(err instanceof Error ? err.message : "Failed to generate experiment");
+      setGenerateError(err instanceof Error ? err.message : "Failed to generate experiment");
     } finally {
       setIsGenerating(false);
     }
@@ -238,7 +270,7 @@ function ExperimentsContent() {
 
       // 2. If user chose to update linked assumption
       if (resultTargetExp.assumption_id && validateAssumptionChoice !== "keep") {
-        await fetch(`/api/projects/${projectId}/assumptions`, {
+        const asmRes = await fetch(`/api/projects/${encodeURIComponent(projectId)}/assumptions`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -246,6 +278,10 @@ function ExperimentsContent() {
             status: validateAssumptionChoice,
           }),
         });
+        const asmData = await asmRes.json();
+        if (!asmRes.ok) {
+          throw new Error(asmData.error?.message || "Failed to update linked assumption status");
+        }
       }
 
       setResultTargetExp(null);
@@ -255,6 +291,37 @@ function ExperimentsContent() {
       alert(err instanceof Error ? err.message : "Failed to save experiment result");
     } finally {
       setIsSavingResult(false);
+    }
+  };
+
+  const handleResultTextChange = (text: string) => {
+    setResultText(text);
+    if (resultTargetExp) {
+      const dec = evaluateExperimentDecision(resultTargetExp, text);
+      setValidateAssumptionChoice(dec.suggestedAssumptionStatus);
+    }
+  };
+
+  const handleUpdateLinkedAssumption = async (
+    assumptionId: string,
+    newStatus: "validated" | "invalidated",
+    hypothesis: string
+  ) => {
+    const label = newStatus === "validated" ? "VALIDATED" : "INVALIDATED";
+    const confirmMsg = `Explicit Assumption Transition:\n\nMark linked assumption as ${label} based on the recorded experiment outcome?\n\nHypothesis: "${hypothesis.slice(0, 80)}…"`;
+    if (!confirm(confirmMsg)) return;
+
+    try {
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/assumptions`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: assumptionId, status: newStatus }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error?.message || "Failed to update assumption status");
+      await loadData();
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : "Failed to update assumption");
     }
   };
 
@@ -292,7 +359,7 @@ function ExperimentsContent() {
           <div className="flex items-center gap-2 mb-2" style={{ fontSize: "0.8125rem", color: "var(--text-muted)" }}>
             <Link href="/" style={{ color: "var(--text-muted)", textDecoration: "none" }}>Dashboard</Link>
             <span>/</span>
-            <Link href="/overview" style={{ color: "var(--text-muted)", textDecoration: "none" }}>Study Planner</Link>
+            <Link href={buildProjectPath("/overview", projectId)} style={{ color: "var(--text-muted)", textDecoration: "none" }}>Project Overview</Link>
             <span>/</span>
             <span style={{ color: "var(--color-accent-light)" }}>Experiments</span>
           </div>
@@ -375,6 +442,8 @@ function ExperimentsContent() {
           {filtered.map((exp: ExperimentRecord, idx) => {
             const statusConf = STATUS_CONFIG[exp.status] || STATUS_CONFIG.planned;
             const isExpanded = expanded === exp.id;
+            const decision = evaluateExperimentDecision(exp);
+            const decCfg = DECISION_CONFIG[decision.outcome];
 
             let parsedRules: { continue?: string; pivot?: string; stop?: string } = {};
             try {
@@ -437,6 +506,24 @@ function ExperimentsContent() {
                       >
                         {statusConf.icon} {statusConf.label}
                       </span>
+                      {exp.result && (
+                        <span
+                          style={{
+                            fontSize: "0.75rem",
+                            padding: "2px 8px",
+                            borderRadius: "var(--radius-sm)",
+                            background: decCfg.bg,
+                            border: `1px solid ${decCfg.border}`,
+                            color: decCfg.color,
+                            fontWeight: 600,
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: "4px",
+                          }}
+                        >
+                          {decCfg.icon} {decCfg.label}
+                        </span>
+                      )}
                       <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>⏱ {exp.duration || "TBD"}</span>
                       <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>💰 {exp.cost_estimate || "$0"}</span>
                       <ProvenanceBadge type={exp.provenance as any} size="sm" />
@@ -444,18 +531,19 @@ function ExperimentsContent() {
                   </div>
 
                   <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
-                    {exp.status !== "completed" && (
-                      <button
-                        className="btn btn-primary btn-sm"
-                        style={{ fontSize: "0.75rem" }}
-                        onClick={() => {
-                          setResultTargetExp(exp);
-                          setResultText(exp.result || "");
-                        }}
-                      >
-                        📝 Record Result
-                      </button>
-                    )}
+                    <button
+                      className={`btn btn-sm ${exp.status !== "completed" ? "btn-primary" : "btn-secondary"}`}
+                      style={{ fontSize: "0.75rem" }}
+                      onClick={() => {
+                        setResultTargetExp(exp);
+                        const initialText = exp.result || "";
+                        setResultText(initialText);
+                        const initialDec = evaluateExperimentDecision(exp, initialText);
+                        setValidateAssumptionChoice(initialDec.suggestedAssumptionStatus);
+                      }}
+                    >
+                      {exp.status !== "completed" ? "📝 Record Result" : "📝 Edit Result"}
+                    </button>
                     <button
                       className="btn btn-secondary btn-sm"
                       onClick={() => handleDelete(exp.id)}
@@ -573,18 +661,140 @@ function ExperimentsContent() {
                       ))}
                     </div>
 
-                    {/* Real Result Display */}
+                    {/* Real Result Display & Falsifiable Decision Loop */}
                     {exp.result ? (
-                      <div style={{ padding: "var(--space-4)", background: "rgba(34,197,94,0.08)", border: "1px solid rgba(34,197,94,0.3)", borderRadius: "var(--radius-md)" }}>
-                        <div className="flex justify-between items-center mb-2">
-                          <span style={{ fontSize: "0.75rem", fontWeight: "600", color: "var(--color-success)" }}>
-                            REAL EXPERIMENT EXECUTION OBSERVATION
-                          </span>
-                          <ProvenanceBadge type="REAL_EXPERIMENT_RESULT" size="sm" />
+                      <div>
+                        {/* Observation Box */}
+                        <div style={{ padding: "var(--space-4)", background: "rgba(34,197,94,0.08)", border: "1px solid rgba(34,197,94,0.3)", borderRadius: "var(--radius-md)" }}>
+                          <div className="flex justify-between items-center mb-2">
+                            <span style={{ fontSize: "0.75rem", fontWeight: "600", color: "var(--color-success)" }}>
+                              REAL EXPERIMENT EXECUTION OBSERVATION
+                            </span>
+                            <ProvenanceBadge type="REAL_EXPERIMENT_RESULT" size="sm" />
+                          </div>
+                          <p style={{ fontSize: "0.875rem", color: "var(--text-primary)", lineHeight: 1.6, margin: 0 }}>
+                            {exp.result}
+                          </p>
                         </div>
-                        <p style={{ fontSize: "0.875rem", color: "var(--text-primary)", lineHeight: 1.6 }}>
-                          {exp.result}
-                        </p>
+
+                        {/* Evidence-Based Hypothesis Evaluation & Decision Loop Card */}
+                        <div
+                          style={{
+                            marginTop: "var(--space-4)",
+                            padding: "var(--space-4) var(--space-5)",
+                            background: decCfg.bg,
+                            border: `1px solid ${decCfg.border}`,
+                            borderRadius: "var(--radius-md)",
+                          }}
+                        >
+                          <div className="flex justify-between items-center mb-3" style={{ flexWrap: "wrap", gap: "8px" }}>
+                            <div className="flex items-center gap-2">
+                              <span
+                                style={{
+                                  fontSize: "0.8125rem",
+                                  fontWeight: 700,
+                                  padding: "3px 10px",
+                                  borderRadius: "var(--radius-sm)",
+                                  background: decCfg.bg,
+                                  border: `1px solid ${decCfg.border}`,
+                                  color: decCfg.color,
+                                  display: "inline-flex",
+                                  alignItems: "center",
+                                  gap: "6px",
+                                }}
+                              >
+                                <span>{decCfg.icon}</span>
+                                <span>Decision Outcome: {decCfg.label}</span>
+                              </span>
+                              <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
+                                Falsifiable Hypothesis Evaluation
+                              </span>
+                            </div>
+                            <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", fontStyle: "italic" }}>
+                              Deterministic Comparison (Zero AI Speculation)
+                            </span>
+                          </div>
+
+                          {/* Predefined Criterion vs Observed Measurement Comparison */}
+                          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: "var(--space-3)", marginBottom: "var(--space-3)" }}>
+                            <div style={{ padding: "var(--space-3)", background: "var(--color-surface)", borderRadius: "var(--radius-sm)", border: "1px solid var(--color-border)" }}>
+                              <div style={{ fontSize: "0.6875rem", color: "var(--text-muted)", textTransform: "uppercase", fontWeight: 600 }}>
+                                Predefined Success Threshold
+                              </div>
+                              <div style={{ fontSize: "0.9375rem", fontWeight: 700, color: "var(--text-primary)", marginTop: "2px" }}>
+                                {exp.threshold}
+                              </div>
+                              <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: "2px" }}>
+                                Metric: {exp.metric} ({decision.thresholdCriteria?.direction === "lower_is_better" ? "Lower is better (<=)" : "Higher is better (>=)"})
+                              </div>
+                            </div>
+
+                            <div style={{ padding: "var(--space-3)", background: "var(--color-surface)", borderRadius: "var(--radius-sm)", border: "1px solid var(--color-border)" }}>
+                              <div style={{ fontSize: "0.6875rem", color: "var(--text-muted)", textTransform: "uppercase", fontWeight: 600 }}>
+                                Observed Measurement
+                              </div>
+                              <div style={{ fontSize: "0.9375rem", fontWeight: 700, color: decCfg.color, marginTop: "2px" }}>
+                                {decision.observedMeasurement.extractedContext || (decision.observedMeasurement.numericValue !== null ? `${decision.observedMeasurement.numericValue}${decision.observedMeasurement.unit || ""}` : "Qualitative observation only")}
+                              </div>
+                              <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: "2px" }}>
+                                Status: {decision.isQuantitative ? "Quantitative data extracted" : "Non-numeric observation"}
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Concise Explanation */}
+                          <div style={{ fontSize: "0.85rem", color: "var(--text-primary)", lineHeight: 1.6, marginBottom: exp.assumption_id ? "var(--space-3)" : 0 }}>
+                            <strong>Decision Rationale:</strong> {decision.explanation}
+                          </div>
+
+                          {/* Linked Risk Assumption Traceability & Action */}
+                          {exp.assumption_id && (
+                            <div
+                              style={{
+                                padding: "var(--space-3)",
+                                background: "rgba(255,255,255,0.03)",
+                                border: "1px dashed var(--color-border)",
+                                borderRadius: "var(--radius-sm)",
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "space-between",
+                                flexWrap: "wrap",
+                                gap: "8px",
+                                fontSize: "0.8125rem",
+                              }}
+                            >
+                              <div style={{ maxWidth: "480px" }}>
+                                <span style={{ color: "var(--text-muted)" }}>Linked Risk Assumption:</span>{" "}
+                                <strong style={{ color: "var(--text-secondary)" }}>{exp.assumption_statement || exp.assumption_id}</strong>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                {decision.outcome === "supported" && (
+                                  <button
+                                    className="btn btn-sm"
+                                    style={{ fontSize: "0.75rem", background: "var(--color-success)", color: "#fff", border: "none" }}
+                                    onClick={() => handleUpdateLinkedAssumption(exp.assumption_id!, "validated", exp.hypothesis)}
+                                  >
+                                    Mark Assumption as VALIDATED
+                                  </button>
+                                )}
+                                {decision.outcome === "rejected" && (
+                                  <button
+                                    className="btn btn-sm"
+                                    style={{ fontSize: "0.75rem", background: "var(--color-error)", color: "#fff", border: "none" }}
+                                    onClick={() => handleUpdateLinkedAssumption(exp.assumption_id!, "invalidated", exp.hypothesis)}
+                                  >
+                                    Mark Assumption as INVALIDATED
+                                  </button>
+                                )}
+                                {decision.outcome === "inconclusive" && (
+                                  <span style={{ fontSize: "0.75rem", color: "#f59e0b", fontStyle: "italic" }}>
+                                    Evidence inconclusive — assumption status unchanged
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          )}
+                        </div>
                       </div>
                     ) : (
                       <div
@@ -598,7 +808,7 @@ function ExperimentsContent() {
                           textAlign: "center",
                         }}
                       >
-                        ⏳ No execution results recorded yet. Click &quot;📝 Record Result&quot; to log observations and earn REAL_EXPERIMENT_RESULT evidence.
+                        ⏳ No execution results recorded yet. Click &quot;📝 Record Result&quot; to log observations and evaluate whether the hypothesis is Supported or Rejected.
                       </div>
                     )}
                   </div>
@@ -619,6 +829,21 @@ function ExperimentsContent() {
             <p style={{ fontSize: "0.85rem", color: "var(--text-secondary)", marginBottom: "var(--space-4)" }}>
               Generates a rigorous, falsifiable experiment plan with concrete metrics and stop/pivot/continue rules.
             </p>
+
+            {generateError && (
+              <div
+                className="card mb-4"
+                style={{
+                  padding: "var(--space-3) var(--space-4)",
+                  background: "rgba(239,68,68,0.1)",
+                  border: "1px solid rgba(239,68,68,0.3)",
+                  color: "var(--color-error)",
+                  fontSize: "0.85rem",
+                }}
+              >
+                ⚠️ {generateError}
+              </div>
+            )}
 
             {generateFeedback ? (
               <div className="card" style={{ padding: "var(--space-4)", background: "rgba(34,197,94,0.1)", border: "1px solid rgba(34,197,94,0.3)", color: "var(--color-success)" }}>
@@ -862,7 +1087,18 @@ function ExperimentsContent() {
                 </div>
               </div>
 
-              <div className="mb-4">
+              <div className="grid-2 mb-4" style={{ gap: "var(--space-3)" }}>
+                <div style={{ padding: "var(--space-2) var(--space-3)", background: "var(--color-surface)", borderRadius: "var(--radius-sm)", border: "1px solid var(--color-border)" }}>
+                  <div style={{ fontSize: "0.7rem", color: "var(--text-muted)", textTransform: "uppercase", fontWeight: 600 }}>Success Metric</div>
+                  <div style={{ fontSize: "0.8125rem", fontWeight: 600, color: "var(--text-secondary)", marginTop: "2px" }}>{resultTargetExp.metric}</div>
+                </div>
+                <div style={{ padding: "var(--space-2) var(--space-3)", background: "var(--color-surface)", borderRadius: "var(--radius-sm)", border: "1px solid var(--color-border)" }}>
+                  <div style={{ fontSize: "0.7rem", color: "var(--text-muted)", textTransform: "uppercase", fontWeight: 600 }}>Success Threshold</div>
+                  <div style={{ fontSize: "0.8125rem", fontWeight: 600, color: "var(--color-accent-light)", marginTop: "2px" }}>{resultTargetExp.threshold}</div>
+                </div>
+              </div>
+
+              <div className="mb-3">
                 <label className="label">Observed Results & Data *</label>
                 <textarea
                   className="input"
@@ -870,13 +1106,44 @@ function ExperimentsContent() {
                   required
                   placeholder="e.g. Recruited 32 students. 18 completed all 3 study blocks (56% vs 40% threshold). 7 students voluntarily shared the WhatsApp link with peers."
                   value={resultText}
-                  onChange={(e) => setResultText(e.target.value)}
+                  onChange={(e) => handleResultTextChange(e.target.value)}
                   style={{ width: "100%" }}
                 />
               </div>
 
+              {/* Live Decision Preview */}
+              {resultText.trim() && (
+                (() => {
+                  const liveDec = evaluateExperimentDecision(resultTargetExp, resultText);
+                  const cfg = DECISION_CONFIG[liveDec.outcome];
+                  return (
+                    <div
+                      style={{
+                        marginBottom: "var(--space-4)",
+                        padding: "var(--space-3)",
+                        borderRadius: "var(--radius-sm)",
+                        background: cfg.bg,
+                        border: `1px solid ${cfg.border}`,
+                      }}
+                    >
+                      <div className="flex items-center justify-between mb-1">
+                        <span style={{ fontSize: "0.75rem", fontWeight: 700, color: cfg.color, display: "inline-flex", alignItems: "center", gap: "4px" }}>
+                          <span>{cfg.icon}</span> Live Decision Preview: {cfg.label}
+                        </span>
+                        <span style={{ fontSize: "0.7rem", color: "var(--text-muted)" }}>
+                          Threshold: {resultTargetExp.threshold}
+                        </span>
+                      </div>
+                      <p style={{ fontSize: "0.8125rem", color: "var(--text-primary)", margin: 0, lineHeight: 1.5 }}>
+                        {liveDec.explanation}
+                      </p>
+                    </div>
+                  );
+                })()
+              )}
+
               {resultTargetExp.assumption_id && (
-                <div className="mb-5">
+                <div className="mb-4">
                   <label className="label">Update Linked Assumption Status</label>
                   <select
                     className="input"
@@ -888,6 +1155,9 @@ function ExperimentsContent() {
                     <option value="invalidated">Mark Assumption as INVALIDATED (Disproven)</option>
                     <option value="keep">Keep Current Status</option>
                   </select>
+                  <p style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: "4px" }}>
+                    ℹ️ Assumption updates are explicit and traceable. Recording observations never silently validates an assumption.
+                  </p>
                 </div>
               )}
 

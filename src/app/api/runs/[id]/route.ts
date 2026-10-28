@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 import { initDb, getDb } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
+import { reconcileProjectStages } from "@/lib/stageReconciliation";
 
 interface RouteParams {
   params: Promise<{ id: string }>;
@@ -27,7 +28,22 @@ export async function GET(req: NextRequest, { params }: RouteParams) {
     if (runRes.rows.length === 0) {
       return apiError("RUN_NOT_FOUND", `Run '${id}' not found.`, 404);
     }
-    const run = runRes.rows[0];
+    const initialRun = runRes.rows[0];
+
+    // Reconcile stage and run progression with real SQLite data (Phase 3J)
+    await reconcileProjectStages(initialRun.project_id as string);
+
+    // Re-fetch Run to get updated status and timestamps
+    const updatedRunRes = await db.execute({
+      sql: `
+        SELECT r.*, p.title as project_title, p.mode as project_mode
+        FROM runs r
+        JOIN projects p ON p.id = r.project_id
+        WHERE r.id = ?
+      `,
+      args: [id],
+    });
+    const run = updatedRunRes.rows[0] || initialRun;
 
     // 2. Fetch Stages
     const stagesRes = await db.execute({

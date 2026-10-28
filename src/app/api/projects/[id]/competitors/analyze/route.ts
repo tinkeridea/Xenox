@@ -1,7 +1,7 @@
 import { NextRequest } from "next/server";
 import { initDb, getDb, nowUtc } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
-import { runInference, validateCompetitor, type CompetitorSchema } from "@/lib/ollama";
+import { runInference, validateCompetitor, isAiInference, type CompetitorSchema } from "@/lib/ollama";
 import { getSemanticCompetitorKey, normalizeCompetitorName } from "@/lib/competitorValidation";
 import type { CompetitorCategory } from "@/types";
 
@@ -39,13 +39,14 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     const db = getDb();
 
     const projRes = await db.execute({
-      sql: "SELECT title FROM projects WHERE id = ?",
+      sql: "SELECT id, title, mode FROM projects WHERE id = ?",
       args: [id],
     });
     if (projRes.rows.length === 0) {
       return apiError("PROJECT_NOT_FOUND", `Project '${id}' not found.`, 404);
     }
-    const project = projRes.rows[0] as unknown as { title: string };
+    const project = projRes.rows[0] as unknown as { id: string; title: string; mode?: string };
+    const isDemoProject = id === "proj-study-planner" || project.mode === "DEMO";
 
     const body = await req.json().catch(() => ({}));
     const focusCategory: string = typeof body.category === "string" ? body.category : "";
@@ -137,6 +138,19 @@ Return a JSON object exactly matching this schema.`;
       fallback,
       fallbackProvenance: "SAMPLE",
     });
+
+    const isLive = isAiInference(outcome);
+
+    // For live customer projects, offline fallbacks are not permitted to masquerade as research
+    if (!isDemoProject && !isLive) {
+      const reason = (outcome as { reason?: string }).reason || "Inference failed";
+      return apiError(
+        "INFERENCE_FAILED",
+        `Ollama local inference failed for live project '${id}': ${reason}. Fallbacks are not permitted for live customer competitor discovery. Start Ollama and retry.`,
+        503,
+        true
+      );
+    }
 
     const now = nowUtc();
     const comp = outcome.data;

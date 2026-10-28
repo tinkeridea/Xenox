@@ -1,8 +1,9 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, Suspense } from "react";
 import Link from "next/link";
 import { ProvenanceBadge } from "@/components/Badges";
+import { useActiveProjectId, buildProjectPath } from "@/lib/useActiveProject";
 
 interface AssumptionRecord {
   id: string;
@@ -35,8 +36,8 @@ const STATUS_CONFIG: Record<string, { label: string; color: string; bg: string }
   invalidated: { label: "Invalidated", color: "var(--color-error)", bg: "rgba(239,68,68,0.1)" },
 };
 
-export default function RisksPage() {
-  const projectId = "proj-study-planner";
+function RisksContent() {
+  const projectId = useActiveProjectId();
   const [assumptions, setAssumptions] = useState<AssumptionRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -57,7 +58,7 @@ export default function RisksPage() {
     try {
       setLoading(true);
       setError(null);
-      const res = await fetch(`/api/projects/${projectId}/assumptions`);
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/assumptions`);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error?.message || "Failed to load assumptions");
       setAssumptions(data.data.assumptions || []);
@@ -77,7 +78,7 @@ export default function RisksPage() {
     if (!statement.trim()) return;
     setIsSubmitting(true);
     try {
-      const res = await fetch(`/api/projects/${projectId}/assumptions`, {
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/assumptions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -104,7 +105,7 @@ export default function RisksPage() {
 
   const handleStatusChange = async (id: string, newStatus: string) => {
     try {
-      const res = await fetch(`/api/projects/${projectId}/assumptions`, {
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/assumptions`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id, status: newStatus }),
@@ -120,7 +121,7 @@ export default function RisksPage() {
   const handleDelete = async (id: string) => {
     if (!confirm("Are you sure you want to remove this assumption? Linked experiments will be unlinked.")) return;
     try {
-      const res = await fetch(`/api/projects/${projectId}/assumptions?assumptionId=${encodeURIComponent(id)}`, {
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/assumptions?assumptionId=${encodeURIComponent(id)}`, {
         method: "DELETE",
       });
       const data = await res.json();
@@ -153,7 +154,7 @@ export default function RisksPage() {
           <div className="flex items-center gap-2 mb-2" style={{ fontSize: "0.8125rem", color: "var(--text-muted)" }}>
             <Link href="/" style={{ color: "var(--text-muted)", textDecoration: "none" }}>Dashboard</Link>
             <span>/</span>
-            <Link href="/overview" style={{ color: "var(--text-muted)", textDecoration: "none" }}>Study Planner</Link>
+            <Link href={buildProjectPath("/overview", projectId)} style={{ color: "var(--text-muted)", textDecoration: "none" }}>Project Overview</Link>
             <span>/</span>
             <span style={{ color: "var(--color-accent-light)" }}>Risks</span>
           </div>
@@ -248,7 +249,7 @@ export default function RisksPage() {
                       <div style={{ fontWeight: 600, color: "var(--text-primary)" }}>{a.statement}</div>
                       <div className="flex justify-between items-center mt-2">
                         <span style={{ fontSize: "0.7rem", color: "#ef4444" }}>Score: {a.priority_score} | {STATUS_CONFIG[a.status]?.label || a.status}</span>
-                        <Link href={`/experiments?assumptionId=${a.id}`} className="btn btn-primary btn-sm" style={{ fontSize: "0.7rem", padding: "2px 8px" }}>
+                        <Link href={buildProjectPath(`/experiments?assumptionId=${a.id}`, projectId)} className="btn btn-primary btn-sm" style={{ fontSize: "0.7rem", padding: "2px 8px" }}>
                           🧪 Test
                         </Link>
                       </div>
@@ -273,7 +274,7 @@ export default function RisksPage() {
                       <div style={{ fontWeight: 600, color: "var(--text-primary)" }}>{a.statement}</div>
                       <div className="flex justify-between items-center mt-2">
                         <span style={{ fontSize: "0.7rem", color: "#f59e0b" }}>Score: {a.priority_score} | {STATUS_CONFIG[a.status]?.label || a.status}</span>
-                        <Link href={`/experiments?assumptionId=${a.id}`} className="btn btn-secondary btn-sm" style={{ fontSize: "0.7rem", padding: "2px 8px" }}>
+                        <Link href={buildProjectPath(`/experiments?assumptionId=${a.id}`, projectId)} className="btn btn-secondary btn-sm" style={{ fontSize: "0.7rem", padding: "2px 8px" }}>
                           🧪 Test
                         </Link>
                       </div>
@@ -298,7 +299,7 @@ export default function RisksPage() {
                       <div style={{ fontWeight: 600, color: "var(--text-primary)" }}>{a.statement}</div>
                       <div className="flex justify-between items-center mt-2">
                         <span style={{ fontSize: "0.7rem", color: "#818cf8" }}>Score: {a.priority_score} | {STATUS_CONFIG[a.status]?.label || a.status}</span>
-                        <Link href={`/experiments?assumptionId=${a.id}`} className="btn btn-secondary btn-sm" style={{ fontSize: "0.7rem", padding: "2px 8px" }}>
+                        <Link href={buildProjectPath(`/experiments?assumptionId=${a.id}`, projectId)} className="btn btn-secondary btn-sm" style={{ fontSize: "0.7rem", padding: "2px 8px" }}>
                           🧪 Test
                         </Link>
                       </div>
@@ -431,7 +432,7 @@ export default function RisksPage() {
                     <ProvenanceBadge type={asm.provenance as any} size="sm" />
 
                     <Link
-                      href={`/experiments?assumptionId=${asm.id}`}
+                      href={buildProjectPath(`/experiments?assumptionId=${asm.id}`, projectId)}
                       className="btn btn-secondary btn-sm"
                       style={{ fontSize: "0.75rem", display: "flex", alignItems: "center", gap: "4px" }}
                     >
@@ -480,7 +481,7 @@ export default function RisksPage() {
                             : "Monitor and validate during MVP rollout."}
                         </p>
                         <Link
-                          href={`/experiments?assumptionId=${asm.id}`}
+                          href={buildProjectPath(`/experiments?assumptionId=${asm.id}`, projectId)}
                           className="btn btn-primary btn-sm"
                           style={{ marginTop: "var(--space-2)", fontSize: "0.8rem", display: "inline-block" }}
                         >
@@ -580,5 +581,13 @@ export default function RisksPage() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function RisksPage() {
+  return (
+    <Suspense fallback={<div className="page-container">Loading risk matrix...</div>}>
+      <RisksContent />
+    </Suspense>
   );
 }

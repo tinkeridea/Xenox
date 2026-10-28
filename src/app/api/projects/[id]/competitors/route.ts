@@ -1,9 +1,11 @@
 import { NextRequest } from "next/server";
 import { initDb, getDb, nowUtc } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
+import { delegateToFastAPI } from "@/lib/fastapiProxy";
 import { runInference } from "@/lib/ollama";
 import { validateCompetitor, type CompetitorSchema } from "@/lib/ollama";
 import type { CompetitorCategory } from "@/types";
+import { reconcileProjectStages } from "@/lib/stageReconciliation";
 
 import { deduplicateCompetitors, getSemanticCompetitorKey, normalizeCompetitorName } from "@/lib/competitorValidation";
 
@@ -11,40 +13,48 @@ interface RouteParams {
   params: Promise<{ id: string }>;
 }
 
+/**
+ * ROLLBACK PATH: Original TypeScript SQLite GET implementation.
+ * To rollback Slice 1Z delegation back to direct TypeScript execution:
+ * Replace `return await delegateToFastAPI(...)` in GET with `return await getCompetitorsFromDb(id);`
+ */
+export async function getCompetitorsFromDb(id: string) {
+  await initDb();
+  const db = getDb();
+
+  const res = await db.execute({
+    sql: "SELECT * FROM competitors WHERE project_id = ? ORDER BY category ASC, name ASC",
+    args: [id],
+  });
+
+  const competitors = deduplicateCompetitors(res.rows as any[]);
+
+  const byCategory: Record<string, number> = {
+    direct: 0,
+    indirect: 0,
+    substitute: 0,
+    status_quo: 0,
+  };
+  for (const row of competitors) {
+    byCategory[row.category] = (byCategory[row.category] || 0) + 1;
+  }
+
+  return apiSuccess({
+    projectId: id,
+    competitors,
+    totalCount: competitors.length,
+    byCategory,
+  });
+}
+
 // ─── GET /api/projects/[id]/competitors ────────────────────────────────────
 export async function GET(req: NextRequest, { params }: RouteParams) {
   try {
-    await initDb();
     const { id } = await params;
-    const db = getDb();
-
-    const res = await db.execute({
-      sql: "SELECT * FROM competitors WHERE project_id = ? ORDER BY category ASC, name ASC",
-      args: [id],
-    });
-
-    const competitors = deduplicateCompetitors(res.rows as any[]);
-
-    const byCategory: Record<string, number> = {
-      direct: 0,
-      indirect: 0,
-      substitute: 0,
-      status_quo: 0,
-    };
-    for (const row of competitors) {
-      byCategory[row.category] = (byCategory[row.category] || 0) + 1;
-    }
-
-    return apiSuccess({
-      projectId: id,
-      competitors,
-      totalCount: competitors.length,
-      byCategory,
-    });
+    return await delegateToFastAPI(req, `/api/projects/${encodeURIComponent(id)}/competitors`);
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error("GET /api/projects/[id]/competitors error:", msg);
-    return apiError("DB_QUERY_FAILED", msg, 500);
+    console.error("GET /api/projects/[id]/competitors proxy error:", err);
+    return apiError("INTERNAL_ERROR", "Failed to retrieve project competitors.", 500);
   }
 }
 
@@ -102,6 +112,9 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
       args: [compId, id, name, category, description, differentiator, provenance, now],
     });
 
+    // Reconcile competitors stage (Phase 3J)
+    await reconcileProjectStages(id);
+
     const created = await db.execute({ sql: "SELECT * FROM competitors WHERE id = ?", args: [compId] });
 
     return apiSuccess({ competitor: created.rows[0] }, "USER_INPUT", 201);
@@ -140,6 +153,9 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
     args.push(compId);
     await db.execute({ sql: `UPDATE competitors SET ${updates.join(", ")} WHERE id = ?`, args });
 
+    // Reconcile competitors stage (Phase 3J)
+    await reconcileProjectStages(id);
+
     const updated = await db.execute({ sql: "SELECT * FROM competitors WHERE id = ?", args: [compId] });
     return apiSuccess({ competitor: updated.rows[0] });
   } catch (err: unknown) {
@@ -165,6 +181,9 @@ export async function DELETE(req: NextRequest, { params }: RouteParams) {
     if (check.rows.length === 0) return apiError("NOT_FOUND", `Competitor '${compId}' not found.`, 404);
 
     await db.execute({ sql: "DELETE FROM competitors WHERE id = ? AND project_id = ?", args: [compId, id] });
+
+    // Reconcile competitors stage (Phase 3J)
+    await reconcileProjectStages(id);
     return apiSuccess({ deleted: compId });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);

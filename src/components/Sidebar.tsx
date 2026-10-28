@@ -1,8 +1,10 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useSearchParams } from "next/navigation";
+import { useState, useEffect } from "react";
 import { ProvenanceBadge } from "@/components/Badges";
+import { useActiveProjectId, useActiveProjectMode, setProjectModeCache, buildProjectPath, KNOWN_PROJECT_TITLES } from "@/lib/useActiveProject";
 
 interface NavItem {
   href: string;
@@ -38,11 +40,59 @@ const SYSTEM_NAV: NavItem[] = [
 
 export function Sidebar() {
   const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const projectId = useActiveProjectId();
+  const projectMode = useActiveProjectMode(projectId);
+  const [projectTitle, setProjectTitle] = useState<string>(
+    () => KNOWN_PROJECT_TITLES[projectId] || projectId
+  );
+
+  useEffect(() => {
+    if (KNOWN_PROJECT_TITLES[projectId]) {
+      setProjectTitle(KNOWN_PROJECT_TITLES[projectId]);
+      return;
+    }
+    let active = true;
+    fetch(`/api/projects/${encodeURIComponent(projectId)}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((json) => {
+        if (active) {
+          if (json?.data?.project?.title) {
+            setProjectTitle(json.data.project.title);
+          }
+          if (json?.data?.project?.mode) {
+            setProjectModeCache(projectId, json.data.project.mode);
+          }
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [projectId]);
 
   function isActive(item: NavItem): boolean {
     if (item.exact) return pathname === item.href;
     return pathname === item.href || pathname.startsWith(item.href + "/");
   }
+
+  // Determine whether the current route has an active project context
+  const isProjectRoute = Boolean(
+    pathname?.startsWith("/overview") ||
+    pathname?.startsWith("/research") ||
+    pathname?.startsWith("/alternatives") ||
+    pathname?.startsWith("/personas") ||
+    pathname?.startsWith("/interviews") ||
+    pathname?.startsWith("/chat") ||
+    pathname?.startsWith("/insights") ||
+    pathname?.startsWith("/risks") ||
+    pathname?.startsWith("/experiments") ||
+    pathname?.startsWith("/mvp") ||
+    pathname?.startsWith("/report") ||
+    pathname?.startsWith("/runs")
+  );
+  const hasExplicitProject = Boolean(searchParams?.get("projectId"));
+  const showProjectBanner = isProjectRoute || hasExplicitProject;
 
   return (
     <aside className="sidebar" role="navigation" aria-label="Main navigation">
@@ -57,35 +107,68 @@ export function Sidebar() {
         </Link>
       </div>
 
-      {/* Global Mode & Health Banner */}
-      <div style={{ padding: "0 var(--space-4) var(--space-3) var(--space-4)" }}>
-        <div
-          style={{
-            background: "rgba(56,189,248,0.08)",
-            border: "1px solid rgba(56,189,248,0.25)",
-            borderRadius: "var(--radius-sm)",
-            padding: "var(--space-2) var(--space-3)",
-            fontSize: "0.75rem",
-            color: "var(--color-info)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-          }}
-        >
-          <span>📋 <strong>Demo Mode Active</strong></span>
-          <span
+      {/* Global Mode & Health Banner (mode-aware) */}
+      {showProjectBanner && projectMode === "DEMO" && (
+        <div style={{ padding: "0 var(--space-4) var(--space-3) var(--space-4)" }}>
+          <div
             style={{
-              fontSize: "0.625rem",
-              background: "rgba(34,197,94,0.15)",
-              color: "var(--color-success)",
-              padding: "1px 5px",
-              borderRadius: "4px",
+              background: "rgba(56,189,248,0.08)",
+              border: "1px solid rgba(56,189,248,0.25)",
+              borderRadius: "var(--radius-sm)",
+              padding: "var(--space-2) var(--space-3)",
+              fontSize: "0.75rem",
+              color: "var(--color-info)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
             }}
           >
-            Offline
-          </span>
+            <span>📋 <strong>Demo Mode Active</strong></span>
+            <span
+              style={{
+                fontSize: "0.625rem",
+                background: "rgba(34,197,94,0.15)",
+                color: "var(--color-success)",
+                padding: "1px 5px",
+                borderRadius: "4px",
+              }}
+            >
+              Offline
+            </span>
+          </div>
         </div>
-      </div>
+      )}
+
+      {showProjectBanner && projectMode === "LIVE" && (
+        <div style={{ padding: "0 var(--space-4) var(--space-3) var(--space-4)" }}>
+          <div
+            style={{
+              background: "rgba(99,102,241,0.08)",
+              border: "1px solid rgba(99,102,241,0.25)",
+              borderRadius: "var(--radius-sm)",
+              padding: "var(--space-2) var(--space-3)",
+              fontSize: "0.75rem",
+              color: "var(--color-accent-light)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+            }}
+          >
+            <span>✨ <strong>Live Validation Workspace</strong></span>
+            <span
+              style={{
+                fontSize: "0.625rem",
+                background: "rgba(99,102,241,0.15)",
+                color: "var(--color-accent-light)",
+                padding: "1px 5px",
+                borderRadius: "4px",
+              }}
+            >
+              Live
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* Navigation */}
       <nav className="sidebar-nav">
@@ -105,12 +188,26 @@ export function Sidebar() {
 
         {/* Current Project Context */}
         <div className="nav-section-label" style={{ marginTop: "var(--space-4)" }}>
-          Active Project: <span style={{ color: "var(--color-accent-light)" }}>Study Planner</span>
+          Active Project:{" "}
+          <span
+            style={{
+              color: "var(--color-accent-light)",
+              display: "inline-block",
+              maxWidth: "140px",
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              verticalAlign: "bottom",
+            }}
+            title={projectTitle}
+          >
+            {projectTitle}
+          </span>
         </div>
         {PROJECT_NAV.map((item) => (
           <Link
             key={item.href}
-            href={item.href}
+            href={buildProjectPath(item.href, projectId)}
             className={`nav-link${isActive(item) ? " active" : ""}`}
             aria-current={isActive(item) ? "page" : undefined}
           >

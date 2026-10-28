@@ -1,7 +1,14 @@
 import { NextRequest } from "next/server";
 import { initDb, getDb, nowUtc } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
-import { searchTinyFish, isTinyFishConfigured } from "@/lib/tinyfish";
+import { searchTinyFish } from "@/lib/tinyfish";
+import { reconcileProjectStages } from "@/lib/stageReconciliation";
+import {
+  isValidHttpUrl,
+  resolveSourceTitle,
+  normalizeSourceUrl,
+  normalizeClaimText,
+} from "@/lib/sourceValidation";
 
 interface RouteParams {
   params: Promise<{ id: string }>;
@@ -63,59 +70,146 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     const now = nowUtc();
     const createdSources: any[] = [];
     const createdEvidence: any[] = [];
+    const batchStatements: Array<{ sql: string; args: any[] }> = [];
 
-    // 4. Ingest and persist results to SQLite
+    // 4. Ingest and persist results to SQLite with conservative deduplication and title safety
+    // Query existing project sources and evidence for project-scoped deduplication
+    const existingSourcesRes = await db.execute({
+      sql: "SELECT id, url, title, publisher FROM sources WHERE project_id = ?",
+      args: [id],
+    });
+
+    const sourceByNormUrl = new Map<string, { id: string; url: string; title: string; publisher: string | null }>();
+    for (const row of existingSourcesRes.rows) {
+      if (typeof row.url === "string" && row.url.trim()) {
+        const norm = normalizeSourceUrl(row.url);
+        if (norm && !sourceByNormUrl.has(norm)) {
+          sourceByNormUrl.set(norm, {
+            id: String(row.id),
+            url: String(row.url),
+            title: String(row.title),
+            publisher: row.publisher ? String(row.publisher) : null,
+          });
+        }
+      }
+    }
+
+    const existingEvidenceRes = await db.execute({
+      sql: "SELECT id, source_id, claim FROM evidence WHERE project_id = ?",
+      args: [id],
+    });
+
+    const existingEvidenceSet = new Set<string>();
+    for (const row of existingEvidenceRes.rows) {
+      if (typeof row.claim === "string") {
+        const normClaim = normalizeClaimText(row.claim);
+        if (normClaim) {
+          existingEvidenceSet.add(`${row.source_id}:::${normClaim}`);
+        }
+      }
+    }
+
+    let itemCounter = 0;
     for (let i = 0; i < searchOutcome.results.length; i++) {
       const item = searchOutcome.results[i];
-      const sourceId = `src-tf-${Date.now()}-${i}`;
-      const evidenceId = `ev-tf-${Date.now()}-${i}`;
+      // Discard items lacking a valid HTTP/HTTPS URL
+      if (!item || !isValidHttpUrl(item.url)) {
+        continue;
+      }
 
-      // Insert Source
-      await db.execute({
-        sql: `INSERT OR IGNORE INTO sources
-                (id, project_id, url, title, publisher, retrieved_at, source_type, provider, created_at)
-              VALUES (?, ?, ?, ?, ?, ?, 'web', 'tinyfish', ?)`,
-        args: [sourceId, id, item.url, item.title, item.site_name, now, now],
-      });
+      const rawUrl = String(item.url).trim();
+      const normUrl = normalizeSourceUrl(rawUrl);
+      const safeTitle = resolveSourceTitle(item.title, rawUrl, item.site_name);
+      const siteName = typeof item.site_name === "string" && item.site_name.trim() ? item.site_name.trim() : null;
 
-      // Insert Evidence (F06: defaults to UNREVIEWED for human review gate)
-      const claimText = item.snippet && item.snippet.length > 10 ? item.snippet : item.title;
+      let sourceId: string;
 
-      await db.execute({
-        sql: `INSERT OR IGNORE INTO evidence
-                (id, project_id, source_id, claim, excerpt, provenance, confidence, reviewer_status, caveat, created_at)
-              VALUES (?, ?, ?, ?, ?, 'REAL_SOURCE', 'High', 'UNREVIEWED', ?, ?)`,
-        args: [
-          evidenceId,
-          id,
-          sourceId,
-          claimText,
-          item.snippet,
-          `Live citation discovered via TinyFish Web Search. Site: ${item.site_name}. Requires human verification.`,
-          now,
-        ],
-      });
+      // Check if source already exists for this project or was registered in earlier iteration of this job
+      if (sourceByNormUrl.has(normUrl)) {
+        sourceId = sourceByNormUrl.get(normUrl)!.id;
+      } else {
+        sourceId = `src-tf-${Date.now()}-${itemCounter++}`;
+        sourceByNormUrl.set(normUrl, {
+          id: sourceId,
+          url: rawUrl,
+          title: safeTitle,
+          publisher: siteName,
+        });
 
-      createdSources.push({
-        id: sourceId,
-        url: item.url,
-        title: item.title,
-        publisher: item.site_name,
-        source_type: "web",
-        provider: "tinyfish",
-      });
+        // Queue concurrency-safe insert
+        batchStatements.push({
+          sql: `INSERT INTO sources
+                  (id, project_id, url, title, publisher, retrieved_at, source_type, provider, created_at)
+                SELECT ?, ?, ?, ?, ?, ?, 'web', 'tinyfish', ?
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM sources WHERE project_id = ? AND (url = ? OR LOWER(TRIM(url)) = LOWER(TRIM(?)))
+                )`,
+          args: [sourceId, id, rawUrl, safeTitle, siteName, now, now, id, rawUrl, rawUrl],
+        });
 
-      createdEvidence.push({
-        id: evidenceId,
-        source_id: sourceId,
-        source_title: item.title,
-        source_url: item.url,
-        claim: claimText,
-        excerpt: item.snippet,
-        provenance: "REAL_SOURCE",
-        confidence: "High",
-        reviewer_status: "UNREVIEWED",
-      });
+        createdSources.push({
+          id: sourceId,
+          url: rawUrl,
+          title: safeTitle,
+          publisher: siteName,
+          source_type: "web",
+          provider: "tinyfish",
+        });
+      }
+
+      // 5. Evidence claim extraction and deduplication
+      const rawSnippet = typeof item.snippet === "string" ? item.snippet.trim() : "";
+      const claimText = rawSnippet.length > 10 ? rawSnippet : safeTitle;
+      const normClaim = normalizeClaimText(claimText);
+      const claimKey = `${sourceId}:::${normClaim}`;
+
+      if (normClaim && !existingEvidenceSet.has(claimKey)) {
+        const evidenceId = `ev-tf-${Date.now()}-${itemCounter++}`;
+        existingEvidenceSet.add(claimKey);
+
+        batchStatements.push({
+          sql: `INSERT INTO evidence
+                  (id, project_id, source_id, claim, excerpt, provenance, confidence, reviewer_status, caveat, created_at)
+                SELECT ?, ?, ?, ?, ?, 'REAL_SOURCE', 'High', 'UNREVIEWED', ?, ?
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM evidence WHERE project_id = ? AND source_id = ? AND LOWER(TRIM(claim)) = LOWER(TRIM(?))
+                )`,
+          args: [
+            evidenceId,
+            id,
+            sourceId,
+            claimText,
+            rawSnippet || null,
+            `Live citation discovered via TinyFish Web Search. Site: ${siteName || safeTitle}. Requires human verification.`,
+            now,
+            id,
+            sourceId,
+            claimText,
+          ],
+        });
+
+        createdEvidence.push({
+          id: evidenceId,
+          source_id: sourceId,
+          source_title: safeTitle,
+          source_url: rawUrl,
+          claim: claimText,
+          excerpt: rawSnippet || null,
+          provenance: "REAL_SOURCE",
+          confidence: "High",
+          reviewer_status: "UNREVIEWED",
+        });
+      }
+    }
+
+    // 6. Execute atomic batch write if any statements queued
+    if (batchStatements.length > 0) {
+      await db.batch(batchStatements);
+    }
+
+    // 7. Reconcile project stages if new entities were created
+    if (createdSources.length > 0 || createdEvidence.length > 0) {
+      await reconcileProjectStages(id);
     }
 
     return apiSuccess(

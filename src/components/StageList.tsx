@@ -5,9 +5,11 @@ import Link from "next/link";
 import type { Stage, StageKey } from "@/types";
 import { STAGE_KEYS, STAGE_LABELS } from "@/types";
 import { StatusDot, ProvenanceBadge } from "@/components/Badges";
+import { useActiveProjectId, buildProjectPath } from "@/lib/useActiveProject";
 
 interface StageListProps {
   stages: Stage[];
+  projectId?: string;
 }
 
 const STAGE_ICONS: Record<StageKey, string> = {
@@ -62,7 +64,8 @@ function formatTime(iso?: string): string {
   }
 }
 
-export function StageList({ stages }: StageListProps) {
+export function StageList({ stages, projectId }: StageListProps) {
+  const activeProjectId = useActiveProjectId(projectId);
   const [expandedKey, setExpandedKey] = useState<StageKey | null>(null);
 
   // Build lookup map
@@ -127,7 +130,7 @@ export function StageList({ stages }: StageListProps) {
                   </span>
                 )}
                 <Link
-                  href={STAGE_ROUTE_MAP[key]}
+                  href={buildProjectPath(STAGE_ROUTE_MAP[key], activeProjectId)}
                   className="btn btn-secondary btn-sm"
                   style={{ fontSize: "0.75rem", padding: "3px 8px" }}
                 >
@@ -183,7 +186,7 @@ export function StageList({ stages }: StageListProps) {
                   <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
                     Attempt: {stage?.attempt ?? 1} • Key: <code className="font-mono">{key}</code>
                   </span>
-                  <Link href={STAGE_ROUTE_MAP[key]} className="btn btn-sm btn-primary" style={{ fontSize: "0.75rem" }}>
+                  <Link href={buildProjectPath(STAGE_ROUTE_MAP[key], activeProjectId)} className="btn btn-sm btn-primary" style={{ fontSize: "0.75rem" }}>
                     Open Dedicated {STAGE_LABELS[key]} Screen
                   </Link>
                 </div>

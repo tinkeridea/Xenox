@@ -2,34 +2,45 @@ import { NextRequest } from "next/server";
 import { initDb, getDb, nowUtc } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
 import { v4 as uuidv4 } from "uuid";
+import { delegateToFastAPI } from "@/lib/fastapiProxy";
 
 interface RouteParams {
   params: Promise<{ id: string }>;
 }
 
-// GET /api/projects/[id]/runs — List runs for a project
+/**
+ * ROLLBACK PATH: Original TypeScript SQLite GET implementation.
+ * To rollback Slice 1S delegation back to direct TypeScript execution:
+ * Replace `return await delegateToFastAPI(...)` in GET with `return getRunsFromDb(id);`
+ */
+export async function getRunsFromDb(id: string) {
+  await initDb();
+  const db = getDb();
+
+  const runsRes = await db.execute({
+    sql: `
+      SELECT r.*, 
+        (SELECT COUNT(*) FROM stages s WHERE s.run_id = r.id AND s.status = 'completed') as completed_stages,
+        (SELECT COUNT(*) FROM stages s WHERE s.run_id = r.id) as total_stages
+      FROM runs r
+      WHERE r.project_id = ?
+      ORDER BY r.created_at DESC
+    `,
+    args: [id],
+  });
+
+  return apiSuccess(runsRes.rows);
+}
+
+// GET /api/projects/[id]/runs — List runs for a project (Delegated to FastAPI via Slice 1S)
 export async function GET(req: NextRequest, { params }: RouteParams) {
   try {
-    await initDb();
     const { id } = await params;
-    const db = getDb();
-
-    const runsRes = await db.execute({
-      sql: `
-        SELECT r.*, 
-          (SELECT COUNT(*) FROM stages s WHERE s.run_id = r.id AND s.status = 'completed') as completed_stages,
-          (SELECT COUNT(*) FROM stages s WHERE s.run_id = r.id) as total_stages
-        FROM runs r
-        WHERE r.project_id = ?
-        ORDER BY r.created_at DESC
-      `,
-      args: [id],
-    });
-
-    return apiSuccess(runsRes.rows);
-  } catch (err: any) {
-    console.error("GET /api/projects/[id]/runs error:", err);
-    return apiError("QUERY_FAILED", err.message, 500);
+    return await delegateToFastAPI(req, `/api/projects/${encodeURIComponent(id)}/runs`);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("GET /api/projects/[id]/runs error:", msg);
+    return apiError("INTERNAL_ERROR", "Failed to retrieve project runs.", 500);
   }
 }
 

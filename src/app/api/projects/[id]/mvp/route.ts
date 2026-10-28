@@ -1,42 +1,53 @@
 import { NextRequest } from "next/server";
 import { initDb, getDb } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
+import { delegateToFastAPI } from "@/lib/fastapiProxy";
+import { reconcileProjectStages } from "@/lib/stageReconciliation";
 
 interface RouteParams {
   params: Promise<{ id: string }>;
 }
 
+/**
+ * ROLLBACK PATH: Original TypeScript SQLite GET implementation.
+ * To rollback Slice 1AC delegation back to direct TypeScript execution:
+ * Replace `return await delegateToFastAPI(...)` in GET with `return await getMvpFeaturesFromDb(id);`
+ */
+export async function getMvpFeaturesFromDb(id: string) {
+  await initDb();
+  const db = getDb();
+
+  const res = await db.execute({
+    sql: `SELECT * FROM mvp_features WHERE project_id = ?
+          ORDER BY CASE priority WHEN 'now' THEN 1 WHEN 'later' THEN 2 WHEN 'omit' THEN 3 ELSE 4 END, name ASC`,
+    args: [id],
+  });
+
+  const features = res.rows.map((row: any) => ({
+    ...row,
+    experiment_ids: row.experiment_ids ? JSON.parse(row.experiment_ids) : [],
+    dependency_ids: row.dependency_ids ? JSON.parse(row.dependency_ids) : [],
+  }));
+
+  const now = features.filter((f: any) => f.priority === "now").length;
+  const later = features.filter((f: any) => f.priority === "later").length;
+  const omit = features.filter((f: any) => f.priority === "omit").length;
+
+  return apiSuccess({
+    projectId: id,
+    features,
+    counts: { now, later, omit, total: features.length },
+  });
+}
+
 // ── GET: List all MVP features for a project ─────────────────────
 export async function GET(req: NextRequest, { params }: RouteParams) {
   try {
-    await initDb();
     const { id } = await params;
-    const db = getDb();
-
-    const res = await db.execute({
-      sql: `SELECT * FROM mvp_features WHERE project_id = ?
-            ORDER BY CASE priority WHEN 'now' THEN 1 WHEN 'later' THEN 2 WHEN 'omit' THEN 3 ELSE 4 END, name ASC`,
-      args: [id],
-    });
-
-    const features = res.rows.map((row: any) => ({
-      ...row,
-      experiment_ids: row.experiment_ids ? JSON.parse(row.experiment_ids) : [],
-      dependency_ids: row.dependency_ids ? JSON.parse(row.dependency_ids) : [],
-    }));
-
-    const now = features.filter((f: any) => f.priority === "now").length;
-    const later = features.filter((f: any) => f.priority === "later").length;
-    const omit = features.filter((f: any) => f.priority === "omit").length;
-
-    return apiSuccess({
-      projectId: id,
-      features,
-      counts: { now, later, omit, total: features.length },
-    });
-  } catch (err: any) {
-    console.error("GET /api/projects/[id]/mvp error:", err);
-    return apiError("DB_QUERY_FAILED", err.message, 500);
+    return await delegateToFastAPI(req, `/api/projects/${encodeURIComponent(id)}/mvp`);
+  } catch (err: unknown) {
+    console.error("GET /api/projects/[id]/mvp proxy error:", err);
+    return apiError("INTERNAL_ERROR", "Failed to retrieve project MVP features.", 500);
   }
 }
 
@@ -97,6 +108,9 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
         provenance,
       ] as any[],
     });
+
+    // Reconcile mvp stage (Phase 3J)
+    await reconcileProjectStages(id);
 
     const created = await db.execute({
       sql: "SELECT * FROM mvp_features WHERE id = ?",
@@ -221,6 +235,9 @@ export async function DELETE(req: NextRequest, { params }: RouteParams) {
       sql: "DELETE FROM mvp_features WHERE id = ? AND project_id = ?",
       args: [featureId, id],
     });
+
+    // Reconcile mvp stage (Phase 3J)
+    await reconcileProjectStages(id);
 
     return apiSuccess({ deleted: featureId });
   } catch (err: any) {

@@ -106,7 +106,17 @@ export function EvidenceBadge({ basis, size }: { basis: EvidenceBasis; size?: "s
 
 // ── FixtureBadge ───────────────────────────────────────────────────
 
-export function FixtureBadge() {
+export interface FixtureBadgeProps {
+  mode?: "DEMO" | "LIVE" | "MIXED" | string | null;
+  isDemo?: boolean;
+}
+
+export function FixtureBadge({ mode, isDemo }: FixtureBadgeProps = {}) {
+  const showDemo = mode === "DEMO" || isDemo === true;
+  if (!showDemo) {
+    return null;
+  }
+
   return (
     <span
       className="badge badge-fixture"

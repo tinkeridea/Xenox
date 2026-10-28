@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 import { initDb, getDb, nowUtc } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
+import { reconcileProjectStages } from "@/lib/stageReconciliation";
 import {
   runInference,
   validatePersonaChat,
@@ -58,14 +59,61 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
       return apiError("PERSONA_NOT_FOUND", `Persona '${id}' not found.`, 404);
     }
     const persona = pRes.rows[0];
+    const personaProjectId = persona.project_id as string;
+
+    // Verify project exists
+    const projRes = await db.execute({
+      sql: "SELECT id FROM projects WHERE id = ?",
+      args: [personaProjectId],
+    });
+    if (projRes.rows.length === 0) {
+      return apiError("PROJECT_NOT_FOUND", `Project '${personaProjectId}' for persona '${id}' not found.`, 404);
+    }
 
     const body = await req.json().catch(() => ({}));
-    const message = body.message?.trim();
+
+    // Verify cross-project isolation: if projectId is provided, it must match persona's project
+    if (body.projectId) {
+      const reqProjectId = String(body.projectId).trim();
+      if (reqProjectId && reqProjectId !== personaProjectId) {
+        return apiError(
+          "PROJECT_MISMATCH",
+          `Persona '${id}' belongs to project '${personaProjectId}', not '${reqProjectId}'. Cross-project chat is forbidden.`,
+          403
+        );
+      }
+    }
+
+    const message = typeof body.message === "string" ? body.message.trim() : "";
     if (!message) {
       return apiError("VALIDATION_ERROR", "Field 'message' is required and cannot be empty.", 400);
     }
 
-    const conversationId = body.sessionId || `chat-${id}-${Date.now()}`;
+    const conversationId = (
+      typeof body.sessionId === "string" && body.sessionId.trim()
+        ? body.sessionId.trim()
+        : typeof body.conversationId === "string" && body.conversationId.trim()
+        ? body.conversationId.trim()
+        : `chat-${id}-${Date.now()}`
+    );
+
+    // Check if interview session already exists
+    const existingIvRes = await db.execute({
+      sql: "SELECT id, project_id, persona_id FROM interviews WHERE id = ?",
+      args: [conversationId],
+    });
+
+    if (existingIvRes.rows.length > 0) {
+      const existingIv = existingIvRes.rows[0];
+      if (existingIv.project_id !== personaProjectId) {
+        return apiError(
+          "PROJECT_MISMATCH",
+          `Session '${conversationId}' belongs to project '${existingIv.project_id}', not '${personaProjectId}'.`,
+          403
+        );
+      }
+    }
+
     const userTurnId = `turn-u-${Date.now()}`;
     const replyTurnId = `turn-a-${Date.now() + 1}`;
 
@@ -105,21 +153,54 @@ Respond in character as this persona. Be authentic to their profile, surface rea
     const isLive = isAiInference(outcome);
     const replyText = outcome.data.reply;
     const dbProvenance = isLive ? "AI_INFERENCE" : "SIMULATED";
+    const modelUsed = isLive ? OLLAMA_MODEL : "fixture_fallback";
 
-    // Save turns in database
-    await db.batch([
-      {
-        sql: "INSERT INTO turns (id, conversation_id, role, text, provenance) VALUES (?,?,?,?,?)",
-        args: [userTurnId, conversationId, "user", message, "USER_INPUT"],
-      },
-      {
-        sql: "INSERT INTO turns (id, conversation_id, role, text, provenance) VALUES (?,?,?,?,?)",
-        args: [replyTurnId, conversationId, "assistant", replyText, dbProvenance],
-      },
-    ]);
+    // Atomically create simulated interview session (if new) and persist turns
+    const batchStatements: Array<{ sql: string; args: any[] }> = [];
+
+    if (existingIvRes.rows.length === 0) {
+      const scenarioText =
+        typeof body.scenario === "string" && body.scenario.trim()
+          ? body.scenario.trim()
+          : `Interactive simulated interview session with ${persona.name} (${persona.segment || "Target Segment"}).`;
+
+      batchStatements.push({
+        sql: `INSERT OR IGNORE INTO interviews (id, project_id, persona_id, scenario, provenance, model, prompt_version, created_at)
+              VALUES (?, ?, ?, ?, 'SIMULATED', ?, ?, ?)`,
+        args: [
+          conversationId,
+          personaProjectId,
+          id,
+          scenarioText,
+          modelUsed,
+          PROMPT_VERSION,
+          nowUtc(),
+        ],
+      });
+    }
+
+    batchStatements.push({
+      sql: "INSERT INTO turns (id, conversation_id, role, text, provenance) VALUES (?,?,?,?,?)",
+      args: [userTurnId, conversationId, "user", message, "USER_INPUT"],
+    });
+    batchStatements.push({
+      sql: "INSERT INTO turns (id, conversation_id, role, text, provenance) VALUES (?,?,?,?,?)",
+      args: [replyTurnId, conversationId, "assistant", replyText, dbProvenance],
+    });
+
+    await db.batch(batchStatements);
+
+    // Trigger stage reconciliation for the project
+    let reconcileResult = null;
+    try {
+      reconcileResult = await reconcileProjectStages(personaProjectId);
+    } catch (reconcileErr) {
+      console.error("Stage reconciliation error during persona chat:", reconcileErr);
+    }
 
     return apiSuccess({
       conversationId,
+      interviewId: conversationId,
       userTurn: { id: userTurnId, role: "user", text: message },
       assistantTurn: {
         id: replyTurnId,
@@ -142,6 +223,12 @@ Respond in character as this persona. Be authentic to their profile, surface rea
             reason: (outcome as { reason: string }).reason,
             mode: "fixture_fallback",
           },
+      reconciledStages: reconcileResult
+        ? {
+            completedStagesCount: reconcileResult.completedStagesCount,
+            runStatus: reconcileResult.runStatus,
+          }
+        : null,
       caveat:
         "⚠️ SIMULATED ARTIFACT — All dialogue is generated hypothesis exploring customer objections. NEVER use synthetic dialogue as proof of customer demand.",
     });

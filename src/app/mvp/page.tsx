@@ -1,11 +1,10 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, Suspense } from "react";
 import Link from "next/link";
 import { ProvenanceBadge } from "@/components/Badges";
+import { useActiveProjectId, buildProjectPath } from "@/lib/useActiveProject";
 import type { MVPPriority } from "@/types";
-
-const PROJECT_ID = "proj-study-planner";
 
 const EFFORT_COLORS: Record<string, { bg: string; text: string; border: string }> = {
   Low: { bg: "rgba(34,197,94,0.12)", text: "var(--color-success)", border: "rgba(34,197,94,0.3)" },
@@ -74,7 +73,8 @@ const EMPTY_FORM: AddFeatureForm = {
   rationale: "",
 };
 
-export default function MvpPlanPage() {
+function MvpPlanContent() {
+  const projectId = useActiveProjectId();
   const [features, setFeatures] = useState<MVPFeatureRow[]>([]);
   const [counts, setCounts] = useState({ now: 0, later: 0, omit: 0, total: 0 });
   const [loading, setLoading] = useState(true);
@@ -100,7 +100,7 @@ export default function MvpPlanPage() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/projects/${PROJECT_ID}/mvp`);
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/mvp`);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error?.message || "Failed to load features");
       setFeatures(data.data.features);
@@ -110,7 +110,7 @@ export default function MvpPlanPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [projectId]);
 
   useEffect(() => {
     fetchFeatures();
@@ -120,7 +120,7 @@ export default function MvpPlanPage() {
   const handleTriage = async (featureId: string, newPriority: MVPPriority) => {
     setTriagingId(featureId);
     try {
-      const res = await fetch(`/api/projects/${PROJECT_ID}/mvp`, {
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/mvp`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ featureId, priority: newPriority }),
@@ -140,7 +140,7 @@ export default function MvpPlanPage() {
     if (!confirm(`Delete feature "${name}"? This cannot be undone.`)) return;
     setDeletingId(featureId);
     try {
-      const res = await fetch(`/api/projects/${PROJECT_ID}/mvp?featureId=${featureId}`, {
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/mvp?featureId=${encodeURIComponent(featureId)}`, {
         method: "DELETE",
       });
       const data = await res.json();
@@ -159,7 +159,7 @@ export default function MvpPlanPage() {
     setAddLoading(true);
     setAddError(null);
     try {
-      const res = await fetch(`/api/projects/${PROJECT_ID}/mvp`, {
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/mvp`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -204,7 +204,7 @@ export default function MvpPlanPage() {
           <div className="flex items-center gap-2 mb-2" style={{ fontSize: "0.8125rem", color: "var(--text-muted)" }}>
             <Link href="/" style={{ color: "var(--text-muted)", textDecoration: "none" }}>Dashboard</Link>
             <span>/</span>
-            <Link href="/overview" style={{ color: "var(--text-muted)", textDecoration: "none" }}>Study Planner</Link>
+            <Link href={buildProjectPath("/overview", projectId)} style={{ color: "var(--text-muted)", textDecoration: "none" }}>Project Overview</Link>
             <span>/</span>
             <span style={{ color: "var(--color-accent-light)" }}>MVP Scope</span>
           </div>
@@ -447,7 +447,7 @@ export default function MvpPlanPage() {
                                   <div style={{ marginTop: "var(--space-2)", display: "flex", gap: "var(--space-2)", alignItems: "center", flexWrap: "wrap" }}>
                                     <span style={{ fontSize: "0.75rem", fontWeight: "600", color: "var(--color-accent-light)" }}>🔬 Linked Experiments:</span>
                                     {f.experiment_ids.map((eid) => (
-                                      <Link key={eid} href="/experiments" style={{ textDecoration: "none", fontSize: "0.75rem", padding: "2px 8px", borderRadius: "var(--radius-sm)", background: "rgba(99,102,241,0.12)", border: "1px solid rgba(99,102,241,0.3)", color: "var(--color-accent-light)", fontWeight: "500" }}>
+                                      <Link key={eid} href={buildProjectPath("/experiments", projectId)} style={{ textDecoration: "none", fontSize: "0.75rem", padding: "2px 8px", borderRadius: "var(--radius-sm)", background: "rgba(99,102,241,0.12)", border: "1px solid rgba(99,102,241,0.3)", color: "var(--color-accent-light)", fontWeight: "500" }}>
                                         {eid}
                                       </Link>
                                     ))}
@@ -597,5 +597,13 @@ export default function MvpPlanPage() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function MvpPlanPage() {
+  return (
+    <Suspense fallback={<div className="page-container">Loading MVP scope...</div>}>
+      <MvpPlanContent />
+    </Suspense>
   );
 }

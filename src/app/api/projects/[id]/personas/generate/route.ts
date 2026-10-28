@@ -11,6 +11,7 @@
 import { NextRequest } from "next/server";
 import { initDb, getDb } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
+import { reconcileProjectStages } from "@/lib/stageReconciliation";
 import {
   runInference,
   validatePersona,
@@ -75,13 +76,14 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
 
     // Verify project exists
     const projRes = await db.execute({
-      sql: "SELECT id, title FROM projects WHERE id = ?",
+      sql: "SELECT id, title, mode FROM projects WHERE id = ?",
       args: [id],
     });
     if (projRes.rows.length === 0) {
       return apiError("PROJECT_NOT_FOUND", `Project '${id}' not found.`, 404);
     }
-    const project = projRes.rows[0];
+    const project = projRes.rows[0] as unknown as { id: string; title: string; mode?: string };
+    const isDemoProject = id === "proj-study-planner" || project.mode === "DEMO";
 
     // Fetch brief for problem context
     const briefRes = await db.execute({
@@ -133,6 +135,18 @@ Rules:
     });
 
     const isLive = isAiInference(outcome);
+
+    // For live customer projects, offline fallbacks are not permitted to masquerade as research
+    if (!isDemoProject && !isLive) {
+      const reason = (outcome as { reason?: string }).reason || "Inference failed";
+      return apiError(
+        "INFERENCE_FAILED",
+        `Ollama local inference failed for live project '${id}': ${reason}. Fallbacks are not permitted for live customer persona drafting. Start Ollama and retry.`,
+        503,
+        true
+      );
+    }
+
     const dbProvenance = isLive ? "AI_INFERENCE" : "SAMPLE";
 
     // Persist to personas table — check if persona with same name already exists for this project (Decision D20)
@@ -191,6 +205,9 @@ Rules:
         ],
       });
     }
+
+    // Reconcile personas stage (Phase 3J)
+    await reconcileProjectStages(id);
 
     return apiSuccess({
       persona: {

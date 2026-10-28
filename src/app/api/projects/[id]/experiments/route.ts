@@ -1,6 +1,8 @@
 import { NextRequest } from "next/server";
 import { initDb, getDb, nowUtc } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
+import { delegateToFastAPI } from "@/lib/fastapiProxy";
+import { reconcileProjectStages } from "@/lib/stageReconciliation";
 
 interface RouteParams {
   params: Promise<{ id: string }>;
@@ -9,37 +11,45 @@ interface RouteParams {
 const VALID_STATUS = ["planned", "running", "completed", "abandoned"] as const;
 type ExperimentStatus = typeof VALID_STATUS[number];
 
+/**
+ * ROLLBACK PATH: Original TypeScript SQLite GET implementation.
+ * To rollback Slice 1AB delegation back to direct TypeScript execution:
+ * Replace `return await delegateToFastAPI(...)` in GET with `return await getExperimentsFromDb(id);`
+ */
+export async function getExperimentsFromDb(id: string) {
+  await initDb();
+  const db = getDb();
+
+  const res = await db.execute({
+    sql: `SELECT e.*, a.statement as assumption_statement, a.uncertainty as assumption_uncertainty, a.impact as assumption_impact
+          FROM experiments e
+          LEFT JOIN assumptions a ON e.assumption_id = a.id
+          WHERE e.project_id = ?
+          ORDER BY e.created_at ASC`,
+    args: [id],
+  });
+
+  const statusCounts: Record<string, number> = {};
+  for (const r of res.rows as any[]) {
+    statusCounts[r.status] = (statusCounts[r.status] || 0) + 1;
+  }
+
+  return apiSuccess({
+    projectId: id,
+    experiments: res.rows,
+    totalCount: res.rows.length,
+    statusCounts,
+  });
+}
+
 // ─── GET /api/projects/[id]/experiments ─────────────────────────────────────
 export async function GET(req: NextRequest, { params }: RouteParams) {
   try {
-    await initDb();
     const { id } = await params;
-    const db = getDb();
-
-    const res = await db.execute({
-      sql: `SELECT e.*, a.statement as assumption_statement, a.uncertainty as assumption_uncertainty, a.impact as assumption_impact
-            FROM experiments e
-            LEFT JOIN assumptions a ON e.assumption_id = a.id
-            WHERE e.project_id = ?
-            ORDER BY e.created_at ASC`,
-      args: [id],
-    });
-
-    const statusCounts: Record<string, number> = {};
-    for (const r of res.rows as any[]) {
-      statusCounts[r.status] = (statusCounts[r.status] || 0) + 1;
-    }
-
-    return apiSuccess({
-      projectId: id,
-      experiments: res.rows,
-      totalCount: res.rows.length,
-      statusCounts,
-    });
+    return await delegateToFastAPI(req, `/api/projects/${encodeURIComponent(id)}/experiments`);
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error("GET /api/projects/[id]/experiments error:", msg);
-    return apiError("DB_QUERY_FAILED", msg, 500);
+    console.error("GET /api/projects/[id]/experiments proxy error:", err);
+    return apiError("INTERNAL_ERROR", "Failed to retrieve project experiments.", 500);
   }
 }
 
@@ -58,14 +68,16 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     const hypothesis: string = typeof body.hypothesis === "string" ? body.hypothesis.trim() : "";
     const method: string = typeof body.method === "string" ? body.method.trim() : "";
     const metric: string = typeof body.metric === "string" ? body.metric.trim() : "";
-    const threshold: string = typeof body.threshold === "string" ? body.threshold.trim() : "";
+    const rawThreshold = body.threshold ?? body.target_threshold;
+    const threshold: string = typeof rawThreshold === "string" ? rawThreshold.trim() : "";
 
     if (!hypothesis) return apiError("VALIDATION_FAILED", "hypothesis is required.", 400);
     if (!method) return apiError("VALIDATION_FAILED", "method is required.", 400);
     if (!metric) return apiError("VALIDATION_FAILED", "metric is required.", 400);
     if (!threshold) return apiError("VALIDATION_FAILED", "threshold is required.", 400);
 
-    const assumptionId: string | null = typeof body.assumptionId === "string" ? body.assumptionId.trim() : null;
+    const rawAssumptionId = body.assumptionId ?? body.assumption_id;
+    const assumptionId: string | null = typeof rawAssumptionId === "string" ? rawAssumptionId.trim() : null;
     const cohort: string = typeof body.cohort === "string" ? body.cohort.trim() : "";
     const duration: string = typeof body.duration === "string" ? body.duration.trim() : "";
     const costEstimate: string = typeof body.cost_estimate === "string" ? body.cost_estimate.trim() : "";
@@ -96,6 +108,9 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
       args: [expId, id, assumptionId, hypothesis, method, cohort, metric, threshold,
              duration, costEstimate, decisionRules, status, now],
     });
+
+    // Reconcile experiments stage (Phase 3J)
+    await reconcileProjectStages(id);
 
     const created = await db.execute({
       sql: `SELECT e.*, a.statement as assumption_statement FROM experiments e
@@ -159,6 +174,9 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
     args.push(expId);
     await db.execute({ sql: `UPDATE experiments SET ${updates.join(", ")} WHERE id = ?`, args });
 
+    // Reconcile experiments stage (Phase 3J)
+    await reconcileProjectStages(id);
+
     const updated = await db.execute({
       sql: `SELECT e.*, a.statement as assumption_statement FROM experiments e
             LEFT JOIN assumptions a ON e.assumption_id = a.id
@@ -192,6 +210,9 @@ export async function DELETE(req: NextRequest, { params }: RouteParams) {
     if (check.rows.length === 0) return apiError("NOT_FOUND", `Experiment '${expId}' not found.`, 404);
 
     await db.execute({ sql: "DELETE FROM experiments WHERE id = ? AND project_id = ?", args: [expId, id] });
+
+    // Reconcile experiments stage (Phase 3J)
+    await reconcileProjectStages(id);
     return apiSuccess({ deleted: expId });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);

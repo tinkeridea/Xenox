@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { ProvenanceBadge, FixtureBadge } from "@/components/Badges";
 import { DEMO_COMPETITORS, DEMO_ICP } from "@/lib/mockData";
+import { useActiveProjectId, useActiveProjectMode, buildProjectPath } from "@/lib/useActiveProject";
 import type { ProvenanceType, ReviewerStatus } from "@/types";
 import {
   isPlaceholderEvidence,
@@ -15,6 +16,12 @@ import {
   getEvidenceConfidenceDisplay,
   PLACEHOLDER_WARNING_TEXT,
 } from "@/lib/evidenceValidation";
+import {
+  generateEvidenceCsv,
+  generateEvidenceJson,
+  downloadFile,
+  sanitizeFilename,
+} from "@/lib/exportUtils";
 
 interface SourceRow {
   id: string;
@@ -139,8 +146,8 @@ function isExamplePlaceholderDomain(url: string | null | undefined): boolean {
 }
 
 function ResearchPageContent() {
-  const searchParams = useSearchParams();
-  const projectId = searchParams?.get("projectId") || "proj-study-planner";
+  const projectId = useActiveProjectId();
+  const projectMode = useActiveProjectMode(projectId);
   const [sources, setSources] = useState<SourceRow[]>([]);
   const [evidence, setEvidence] = useState<EvidenceRow[]>([]);
   const [loading, setLoading] = useState(true);
@@ -154,13 +161,22 @@ function ResearchPageContent() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [copiedUrl, setCopiedUrl] = useState<string | null>(null);
 
+  const isDemo = projectMode === "DEMO";
+  const [briefTargetCustomer, setBriefTargetCustomer] = useState<string>("");
+  const [briefProblem, setBriefProblem] = useState<string>("");
+  const [personas, setPersonas] = useState<any[]>([]);
+  const [competitors, setCompetitors] = useState<any[]>([]);
+  const [queryCustomized, setQueryCustomized] = useState(false);
+
   // Modals & Forms
   const [showAddSource, setShowAddSource] = useState(false);
   const [showAddEvidence, setShowAddEvidence] = useState(false);
   const [showTinyFishModal, setShowTinyFishModal] = useState(false);
   const [showLiveResearchModal, setShowLiveResearchModal] = useState(false);
   const [researching, setResearching] = useState(false);
-  const [liveResearchQuery, setLiveResearchQuery] = useState("college student study planning exam anxiety India");
+  const [liveResearchQuery, setLiveResearchQuery] = useState(
+    projectId === "proj-study-planner" ? "college student study planning exam anxiety India" : ""
+  );
   const [editItem, setEditItem] = useState<EvidenceRow | null>(null);
 
   // Form states - Source
@@ -254,17 +270,49 @@ function ResearchPageContent() {
     }
   };
 
-  // Fetch live evidence & sources from SQLite API
+  // Fetch live evidence & sources from SQLite API, alongside project personas & competitors
   const loadData = useCallback(async (isSilent = false) => {
     if (!isSilent) setLoading(true);
     setRefreshing(true);
     try {
-      const res = await fetch(`/api/projects/${projectId}/evidence`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const json = await res.json();
-      if (json.data) {
-        setSources(json.data.sources || []);
-        setEvidence(json.data.evidence || []);
+      const [evRes, projRes, compRes, persRes] = await Promise.all([
+        fetch(`/api/projects/${encodeURIComponent(projectId)}/evidence`),
+        fetch(`/api/projects/${encodeURIComponent(projectId)}`),
+        fetch(`/api/projects/${encodeURIComponent(projectId)}/competitors`),
+        fetch(`/api/projects/${encodeURIComponent(projectId)}/personas`),
+      ]);
+
+      if (evRes.ok) {
+        const evJson = await evRes.json();
+        if (evJson.data) {
+          setSources(evJson.data.sources || []);
+          setEvidence(evJson.data.evidence || []);
+        }
+      }
+
+      if (projRes.ok) {
+        const projJson = await projRes.json();
+        const brief = projJson.data?.brief;
+        if (brief) {
+          if (brief.target_customer) setBriefTargetCustomer(brief.target_customer);
+          if (brief.problem) {
+            setBriefProblem(brief.problem);
+            if (!queryCustomized) {
+              const derived = brief.problem.trim().slice(0, 100);
+              if (derived) setLiveResearchQuery(derived);
+            }
+          }
+        }
+      }
+
+      if (compRes.ok) {
+        const compJson = await compRes.json();
+        setCompetitors(compJson.data?.competitors || []);
+      }
+
+      if (persRes.ok) {
+        const persJson = await persRes.json();
+        setPersonas(persJson.data?.personas || []);
       }
     } catch (err: unknown) {
       console.error("Failed to load research data:", err);
@@ -273,7 +321,7 @@ function ResearchPageContent() {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [projectId]);
+  }, [projectId, queryCustomized]);
 
   useEffect(() => {
     loadData();
@@ -439,6 +487,24 @@ function ResearchPageContent() {
     }
   };
 
+  // Handle Evidence Export
+  const handleExportEvidenceCsv = () => {
+    const csv = generateEvidenceCsv(evidence, projectId);
+    const filename = `ideaprobe-evidence-ledger-${sanitizeFilename(projectId)}.csv`;
+    downloadFile(csv, filename, "text/csv;charset=utf-8;");
+    showNotification("Evidence ledger exported as CSV");
+  };
+
+  const handleExportEvidenceJson = () => {
+    const jsonObj = generateEvidenceJson(evidence, {
+      projectId,
+      mode: projectMode,
+    });
+    const filename = `ideaprobe-evidence-ledger-${sanitizeFilename(projectId)}.json`;
+    downloadFile(JSON.stringify(jsonObj, null, 2), filename, "application/json;charset=utf-8;");
+    showNotification("Evidence ledger exported as JSON");
+  };
+
   // Filter evidence
   const filteredEvidence = evidence.filter((item) => {
     if (filterProvenance !== "All" && item.provenance !== filterProvenance) return false;
@@ -472,7 +538,7 @@ function ResearchPageContent() {
           <div className="flex items-center gap-2 mb-2" style={{ fontSize: "0.8125rem", color: "var(--text-muted)" }}>
             <Link href="/" style={{ color: "var(--text-muted)", textDecoration: "none" }}>Dashboard</Link>
             <span>/</span>
-            <Link href="/overview" style={{ color: "var(--text-muted)", textDecoration: "none" }}>Study Planner</Link>
+            <Link href={buildProjectPath("/overview", projectId)} style={{ color: "var(--text-muted)", textDecoration: "none" }}>Project Overview</Link>
             <span>/</span>
             <span style={{ color: "var(--color-accent-light)" }}>Research & Evidence</span>
           </div>
@@ -480,7 +546,7 @@ function ResearchPageContent() {
             <h1 style={{ fontSize: "1.75rem", fontWeight: "700", color: "var(--text-primary)" }}>
               Market Research & Evidence Ledger
             </h1>
-            <FixtureBadge />
+            <FixtureBadge mode={projectMode} />
           </div>
           <p style={{ color: "var(--text-secondary)", marginTop: "var(--space-1)", fontSize: "0.9rem" }}>
             F04 / F05 / F06 — Live SQLite Source Registry, Claim Ledger, and Human Review Gate
@@ -509,6 +575,24 @@ function ResearchPageContent() {
             id="btn-add-evidence"
           >
             + Add Evidence Item
+          </button>
+          <button
+            className="btn btn-secondary btn-sm"
+            onClick={handleExportEvidenceCsv}
+            id="export-evidence-csv-top-btn"
+            title="Export evidence ledger as CSV"
+            style={{ display: "flex", alignItems: "center", gap: "5px" }}
+          >
+            <span>📥</span> Export CSV
+          </button>
+          <button
+            className="btn btn-secondary btn-sm"
+            onClick={handleExportEvidenceJson}
+            id="export-evidence-json-top-btn"
+            title="Export evidence ledger as JSON"
+            style={{ display: "flex", alignItems: "center", gap: "5px" }}
+          >
+            <span>📥</span> Export JSON
           </button>
           <button
             className="btn btn-secondary btn-sm"
@@ -721,6 +805,28 @@ function ResearchPageContent() {
                     fontSize: "0.8rem",
                   }}
                 />
+              </div>
+
+              {/* Export Buttons */}
+              <div className="flex items-center gap-2">
+                <button
+                  id="export-evidence-csv-btn"
+                  className="btn btn-secondary btn-sm"
+                  onClick={handleExportEvidenceCsv}
+                  title="Export evidence ledger as CSV"
+                  style={{ display: "flex", alignItems: "center", gap: "5px", fontSize: "0.75rem", padding: "4px 10px" }}
+                >
+                  <span>📥</span> CSV
+                </button>
+                <button
+                  id="export-evidence-json-btn"
+                  className="btn btn-secondary btn-sm"
+                  onClick={handleExportEvidenceJson}
+                  title="Export evidence ledger as JSON"
+                  style={{ display: "flex", alignItems: "center", gap: "5px", fontSize: "0.75rem", padding: "4px 10px" }}
+                >
+                  <span>📥</span> JSON
+                </button>
               </div>
             </div>
           </div>
@@ -1373,53 +1479,148 @@ function ResearchPageContent() {
       )}
 
       {/* ICP Quick View */}
-      <div className="card mt-8" style={{ padding: "var(--space-5)", border: "1px solid var(--color-border)" }}>
-        <div className="flex justify-between items-center mb-3" style={{ flexWrap: "wrap", gap: "var(--space-2)" }}>
-          <div className="flex items-center gap-2">
-            <span style={{ fontSize: "1.1rem" }}>🎯</span>
-            <h2 style={{ fontSize: "1rem", fontWeight: "600", color: "var(--text-primary)" }}>
-              Ideal Customer Profile (ICP Baseline)
-            </h2>
-            <ProvenanceBadge type={DEMO_ICP.provenance} size="sm" />
+      {isDemo ? (
+        <div className="card mt-8" style={{ padding: "var(--space-5)", border: "1px solid var(--color-border)" }}>
+          <div className="flex justify-between items-center mb-3" style={{ flexWrap: "wrap", gap: "var(--space-2)" }}>
+            <div className="flex items-center gap-2">
+              <span style={{ fontSize: "1.1rem" }}>🎯</span>
+              <h2 style={{ fontSize: "1rem", fontWeight: "600", color: "var(--text-primary)" }}>
+                Ideal Customer Profile (Sample Fixture Baseline)
+              </h2>
+              <ProvenanceBadge type="SAMPLE" size="sm" />
+            </div>
+            <Link href={buildProjectPath("/personas", projectId)} className="btn btn-secondary btn-sm" style={{ fontSize: "0.8rem" }}>
+              View Personas →
+            </Link>
           </div>
-          <Link href="/personas" className="btn btn-secondary btn-sm" style={{ fontSize: "0.8rem" }}>
-            View Personas →
-          </Link>
+          <p style={{ fontSize: "0.875rem", color: "var(--text-secondary)", marginBottom: "var(--space-3)" }}>
+            <strong>{DEMO_ICP.primarySegment}</strong> — {DEMO_ICP.jobToBeDone}
+          </p>
         </div>
-        <p style={{ fontSize: "0.875rem", color: "var(--text-secondary)", marginBottom: "var(--space-3)" }}>
-          <strong>{DEMO_ICP.primarySegment}</strong> — {DEMO_ICP.jobToBeDone}
-        </p>
-      </div>
+      ) : personas.length > 0 ? (
+        <div className="card mt-8" style={{ padding: "var(--space-5)", border: "1px solid var(--color-border)" }}>
+          <div className="flex justify-between items-center mb-3" style={{ flexWrap: "wrap", gap: "var(--space-2)" }}>
+            <div className="flex items-center gap-2">
+              <span style={{ fontSize: "1.1rem" }}>🎯</span>
+              <h2 style={{ fontSize: "1rem", fontWeight: "600", color: "var(--text-primary)" }}>
+                Ideal Customer Profile (Persona Baseline)
+              </h2>
+              <ProvenanceBadge type={personas[0].provenance || "AI_INFERENCE"} size="sm" />
+            </div>
+            <Link href={buildProjectPath("/personas", projectId)} className="btn btn-secondary btn-sm" style={{ fontSize: "0.8rem" }}>
+              View Personas ({personas.length}) →
+            </Link>
+          </div>
+          <p style={{ fontSize: "0.875rem", color: "var(--text-secondary)", marginBottom: "var(--space-3)" }}>
+            <strong>{personas[0].name} ({personas[0].segment || "Target Segment"})</strong> — {personas[0].jobs || personas[0].goals || "Active customer persona"}
+          </p>
+        </div>
+      ) : (
+        <div className="card mt-8" style={{ padding: "var(--space-5)", border: "1px solid var(--color-border)" }}>
+          <div className="flex justify-between items-center mb-3" style={{ flexWrap: "wrap", gap: "var(--space-2)" }}>
+            <div className="flex items-center gap-2">
+              <span style={{ fontSize: "1.1rem" }}>🎯</span>
+              <h2 style={{ fontSize: "1rem", fontWeight: "600", color: "var(--text-primary)" }}>
+                Ideal Customer Profile (Target Customer Baseline)
+              </h2>
+              <ProvenanceBadge type="USER_INPUT" size="sm" />
+            </div>
+            <Link href={buildProjectPath("/personas", projectId)} className="btn btn-secondary btn-sm" style={{ fontSize: "0.8rem" }}>
+              + Draft Personas →
+            </Link>
+          </div>
+          <p style={{ fontSize: "0.875rem", color: "var(--text-secondary)", marginBottom: "var(--space-2)" }}>
+            <strong>Target Customer:</strong> {briefTargetCustomer || "No target customer specified in brief yet."}
+          </p>
+          <p style={{ fontSize: "0.8125rem", color: "var(--text-muted)" }}>
+            No simulated personas have been drafted for this project yet. Use the Personas module to create simulated interviews and ICP profiles.
+          </p>
+        </div>
+      )}
 
       {/* Alternative Solutions preview */}
-      <div className="card mt-6 mb-8" style={{ padding: "var(--space-5)" }}>
-        <div className="flex justify-between items-center mb-4">
-          <h2 style={{ fontSize: "1rem", fontWeight: "600", color: "var(--text-primary)" }}>
-            Alternative Solutions Mapped ({DEMO_COMPETITORS.length})
-          </h2>
-          <Link href="/alternatives" className="btn btn-secondary btn-sm" style={{ fontSize: "0.8rem" }}>
-            View Full Map →
-          </Link>
+      {isDemo ? (
+        <div className="card mt-6 mb-8" style={{ padding: "var(--space-5)" }}>
+          <div className="flex justify-between items-center mb-4">
+            <div className="flex items-center gap-2">
+              <h2 style={{ fontSize: "1rem", fontWeight: "600", color: "var(--text-primary)" }}>
+                Alternative Solutions Mapped ({DEMO_COMPETITORS.length})
+              </h2>
+              <ProvenanceBadge type="SAMPLE" size="sm" />
+            </div>
+            <Link href={buildProjectPath("/alternatives", projectId)} className="btn btn-secondary btn-sm" style={{ fontSize: "0.8rem" }}>
+              View Full Map →
+            </Link>
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "var(--space-2)" }}>
+            {DEMO_COMPETITORS.map((c) => (
+              <span
+                key={c.id}
+                style={{
+                  fontSize: "0.8rem",
+                  padding: "4px 10px",
+                  borderRadius: "var(--radius-sm)",
+                  background: "var(--color-surface-2)",
+                  border: "1px solid var(--color-border)",
+                  color: "var(--text-secondary)",
+                }}
+              >
+                {c.name}
+                <span style={{ marginLeft: "6px", opacity: 0.6, fontSize: "0.7rem" }}>({c.category})</span>
+              </span>
+            ))}
+          </div>
         </div>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: "var(--space-2)" }}>
-          {DEMO_COMPETITORS.map((c) => (
-            <span
-              key={c.id}
-              style={{
-                fontSize: "0.8rem",
-                padding: "4px 10px",
-                borderRadius: "var(--radius-sm)",
-                background: "var(--color-surface-2)",
-                border: "1px solid var(--color-border)",
-                color: "var(--text-secondary)",
-              }}
-            >
-              {c.name}
-              <span style={{ marginLeft: "6px", opacity: 0.6, fontSize: "0.7rem" }}>({c.category})</span>
-            </span>
-          ))}
+      ) : competitors.length > 0 ? (
+        <div className="card mt-6 mb-8" style={{ padding: "var(--space-5)" }}>
+          <div className="flex justify-between items-center mb-4">
+            <div className="flex items-center gap-2">
+              <h2 style={{ fontSize: "1rem", fontWeight: "600", color: "var(--text-primary)" }}>
+                Alternative Solutions Mapped ({competitors.length})
+              </h2>
+            </div>
+            <Link href={buildProjectPath("/alternatives", projectId)} className="btn btn-secondary btn-sm" style={{ fontSize: "0.8rem" }}>
+              View Full Map →
+            </Link>
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "var(--space-2)" }}>
+            {competitors.map((c) => (
+              <span
+                key={c.id}
+                style={{
+                  fontSize: "0.8rem",
+                  padding: "4px 10px",
+                  borderRadius: "var(--radius-sm)",
+                  background: "var(--color-surface-2)",
+                  border: "1px solid var(--color-border)",
+                  color: "var(--text-secondary)",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "6px",
+                }}
+              >
+                <span>{c.name}</span>
+                <span style={{ opacity: 0.6, fontSize: "0.7rem" }}>({c.category})</span>
+                {c.provenance && <ProvenanceBadge type={c.provenance} size="sm" />}
+              </span>
+            ))}
+          </div>
         </div>
-      </div>
+      ) : (
+        <div className="card mt-6 mb-8" style={{ padding: "var(--space-5)" }}>
+          <div className="flex justify-between items-center mb-3">
+            <h2 style={{ fontSize: "1rem", fontWeight: "600", color: "var(--text-primary)" }}>
+              Alternative Solutions Mapped (0)
+            </h2>
+            <Link href={buildProjectPath("/alternatives", projectId)} className="btn btn-secondary btn-sm" style={{ fontSize: "0.8rem" }}>
+              + Map Competitors →
+            </Link>
+          </div>
+          <p style={{ fontSize: "0.8125rem", color: "var(--text-muted)" }}>
+            No alternative solutions or direct/indirect competitors mapped for this project yet. Use the Alternatives module to discover and record substitutes.
+          </p>
+        </div>
+      )}
 
       {/* ── MODAL: ADD SOURCE ── */}
       {showAddSource && (
@@ -1884,7 +2085,10 @@ function ResearchPageContent() {
                   type="text"
                   required
                   value={liveResearchQuery}
-                  onChange={(e) => setLiveResearchQuery(e.target.value)}
+                  onChange={(e) => {
+                    setLiveResearchQuery(e.target.value);
+                    setQueryCustomized(true);
+                  }}
                   style={{
                     width: "100%",
                     padding: "10px 14px",

@@ -1,6 +1,5 @@
 import React from "react";
 import { IdeaForm } from "@/components/IdeaForm";
-import { FixtureBadge } from "@/components/Badges";
 
 export const metadata = {
   title: "New Validation Intake — IdeaProbe",
@@ -19,7 +18,6 @@ export default function NewIntakePage() {
             Feature F01: Structured capture of venture hypotheses and baseline constraints.
           </p>
         </div>
-        <FixtureBadge />
       </div>
 
       <IdeaForm />

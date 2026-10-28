@@ -1,8 +1,9 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, Suspense } from "react";
 import Link from "next/link";
 import { ProvenanceBadge, FixtureBadge, SimulationAlert } from "@/components/Badges";
+import { useActiveProjectId, useActiveProjectMode, buildProjectPath } from "@/lib/useActiveProject";
 import type { ProvenanceType } from "@/types";
 
 interface PersonaItem {
@@ -43,8 +44,9 @@ const FIELD_LABELS: Record<string, string> = {
   assumptions: "Underlying Assumptions",
 };
 
-export default function PersonasPage() {
-  const [projectId] = useState("proj-study-planner");
+function PersonasContent() {
+  const projectId = useActiveProjectId();
+  const projectMode = useActiveProjectMode(projectId);
   const [personas, setPersonas] = useState<PersonaItem[]>([]);
   const [selectedId, setSelectedId] = useState<string>("");
   const [loading, setLoading] = useState(true);
@@ -64,7 +66,7 @@ export default function PersonasPage() {
   const loadPersonas = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await fetch(`/api/projects/${projectId}/personas`);
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/personas`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
       const list: PersonaItem[] = json.data?.personas || [];
@@ -89,14 +91,15 @@ export default function PersonasPage() {
     setDrafting(true);
     setShowDraftModal(false);
     try {
-      const res = await fetch(`/api/projects/${projectId}/personas/generate`, {
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/personas/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ segmentHint: segmentPrompt.trim() || undefined }),
       });
 
       if (!res.ok) {
-        throw new Error(`Endpoint returned HTTP ${res.status}`);
+        const errJson = await res.json().catch(() => null);
+        throw new Error(errJson?.error?.message || `Endpoint returned HTTP ${res.status}`);
       }
 
       const json = await res.json();
@@ -166,7 +169,7 @@ export default function PersonasPage() {
           <div className="flex items-center gap-2 mb-2" style={{ fontSize: "0.8125rem", color: "var(--text-muted)" }}>
             <Link href="/" style={{ color: "var(--text-muted)", textDecoration: "none" }}>Dashboard</Link>
             <span>/</span>
-            <Link href="/overview" style={{ color: "var(--text-muted)", textDecoration: "none" }}>Study Planner</Link>
+            <Link href={buildProjectPath("/overview", projectId)} style={{ color: "var(--text-muted)", textDecoration: "none" }}>Project Overview</Link>
             <span>/</span>
             <span style={{ color: "var(--color-accent-light)" }}>Personas</span>
           </div>
@@ -174,7 +177,7 @@ export default function PersonasPage() {
             <h1 style={{ fontSize: "1.75rem", fontWeight: "700", color: "var(--text-primary)" }}>
               Customer Persona Hypotheses (F08)
             </h1>
-            <FixtureBadge />
+            <FixtureBadge mode={projectMode} />
           </div>
           <p style={{ color: "var(--text-secondary)", marginTop: "var(--space-1)", fontSize: "0.9rem" }}>
             Structured customer archetype hypotheses synthesized from evidence ledger by Ollama local inference.
@@ -308,14 +311,14 @@ export default function PersonasPage() {
 
             <div style={{ marginTop: "var(--space-4)", display: "flex", flexDirection: "column", gap: "var(--space-2)" }}>
               <Link
-                href="/chat"
+                href={buildProjectPath("/chat", projectId)}
                 className="btn btn-primary btn-sm"
                 style={{ textAlign: "center", display: "block" }}
               >
                 💬 Open Persona Chat (F10) →
               </Link>
               <Link
-                href="/interviews"
+                href={buildProjectPath("/interviews", projectId)}
                 className="btn btn-secondary btn-sm"
                 style={{ textAlign: "center", display: "block" }}
               >
@@ -346,7 +349,7 @@ export default function PersonasPage() {
                   </div>
 
                   <Link
-                    href={`/chat`}
+                    href={buildProjectPath("/chat", projectId)}
                     className="btn btn-secondary btn-sm"
                     style={{ fontSize: "0.8rem" }}
                   >
@@ -480,5 +483,13 @@ export default function PersonasPage() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function PersonasPage() {
+  return (
+    <Suspense fallback={<div className="page-container">Loading personas...</div>}>
+      <PersonasContent />
+    </Suspense>
   );
 }

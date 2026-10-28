@@ -1,6 +1,8 @@
 import { NextRequest } from "next/server";
 import { initDb, getDb, nowUtc } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
+import { delegateToFastAPI } from "@/lib/fastapiProxy";
+import { reconcileProjectStages } from "@/lib/stageReconciliation";
 
 interface RouteParams {
   params: Promise<{ id: string }>;
@@ -19,40 +21,48 @@ function calcPriorityScore(uncertainty: string, impact: string): number {
   return (UNCERTAINTY_SCORE[uncertainty] || 1) * (IMPACT_SCORE[impact] || 1);
 }
 
+/**
+ * ROLLBACK PATH: Original TypeScript SQLite GET implementation.
+ * To rollback Slice 1AA delegation back to direct TypeScript execution:
+ * Replace `return await delegateToFastAPI(...)` in GET with `return await getAssumptionsFromDb(id);`
+ */
+export async function getAssumptionsFromDb(id: string) {
+  await initDb();
+  const db = getDb();
+
+  const res = await db.execute({
+    sql: "SELECT * FROM assumptions WHERE project_id = ? ORDER BY uncertainty DESC, impact DESC",
+    args: [id],
+  });
+
+  const assumptions = (res.rows as any[]).map((row) => ({
+    ...row,
+    evidence_ids: row.evidence_ids ? JSON.parse(row.evidence_ids) : [],
+    priority_score: calcPriorityScore(row.uncertainty, row.impact),
+  }));
+
+  // Count by status for matrix summary
+  const statusCounts: Record<string, number> = {};
+  for (const a of assumptions) {
+    statusCounts[a.status] = (statusCounts[a.status] || 0) + 1;
+  }
+
+  return apiSuccess({
+    projectId: id,
+    assumptions,
+    totalCount: assumptions.length,
+    statusCounts,
+  });
+}
+
 // ─── GET /api/projects/[id]/assumptions ─────────────────────────────────────
 export async function GET(req: NextRequest, { params }: RouteParams) {
   try {
-    await initDb();
     const { id } = await params;
-    const db = getDb();
-
-    const res = await db.execute({
-      sql: "SELECT * FROM assumptions WHERE project_id = ? ORDER BY uncertainty DESC, impact DESC",
-      args: [id],
-    });
-
-    const assumptions = (res.rows as any[]).map((row) => ({
-      ...row,
-      evidence_ids: row.evidence_ids ? JSON.parse(row.evidence_ids) : [],
-      priority_score: calcPriorityScore(row.uncertainty, row.impact),
-    }));
-
-    // Count by status for matrix summary
-    const statusCounts: Record<string, number> = {};
-    for (const a of assumptions) {
-      statusCounts[a.status] = (statusCounts[a.status] || 0) + 1;
-    }
-
-    return apiSuccess({
-      projectId: id,
-      assumptions,
-      totalCount: assumptions.length,
-      statusCounts,
-    });
+    return await delegateToFastAPI(req, `/api/projects/${encodeURIComponent(id)}/assumptions`);
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error("GET /api/projects/[id]/assumptions error:", msg);
-    return apiError("DB_QUERY_FAILED", msg, 500);
+    console.error("GET /api/projects/[id]/assumptions proxy error:", err);
+    return apiError("INTERNAL_ERROR", "Failed to retrieve project assumptions.", 500);
   }
 }
 
@@ -98,6 +108,9 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
       args: [asmId, id, statement, category, impact, uncertainty, rationale, status,
              JSON.stringify(evidenceIds), now],
     });
+
+    // Reconcile risks stage (Phase 3J)
+    await reconcileProjectStages(id);
 
     const created = await db.execute({ sql: "SELECT * FROM assumptions WHERE id = ?", args: [asmId] });
     const row = created.rows[0] as any;
@@ -176,6 +189,9 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
     args.push(asmId);
     await db.execute({ sql: `UPDATE assumptions SET ${updates.join(", ")} WHERE id = ?`, args });
 
+    // Reconcile risks stage (Phase 3J)
+    await reconcileProjectStages(id);
+
     const updated = await db.execute({ sql: "SELECT * FROM assumptions WHERE id = ?", args: [asmId] });
     const row = updated.rows[0] as any;
     return apiSuccess({
@@ -217,6 +233,9 @@ export async function DELETE(req: NextRequest, { params }: RouteParams) {
     });
 
     await db.execute({ sql: "DELETE FROM assumptions WHERE id = ? AND project_id = ?", args: [asmId, id] });
+
+    // Reconcile risks stage (Phase 3J)
+    await reconcileProjectStages(id);
     return apiSuccess({ deleted: asmId });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);

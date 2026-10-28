@@ -23,12 +23,30 @@ const DB_PATH = path.join(DATA_DIR, "ideaprobe.db");
 
 // ── Singleton libsql client ───────────────────────────────────────
 let _client: Client | null = null;
+let _activeDbPath: string | null = null;
+let _initializedPath: string | null = null;
 
 export function getDb(): Client {
-  if (!_client) {
-    _client = createClient({ url: `file:${DB_PATH}` });
+  const targetPath = process.env.IDEAPROBE_DB_PATH
+    ? path.resolve(process.env.IDEAPROBE_DB_PATH)
+    : DB_PATH;
+
+  if (!_client || _activeDbPath !== targetPath) {
+    _client = createClient({ url: `file:${targetPath.replace(/\\/g, "/")}` });
+    _activeDbPath = targetPath;
   }
   return _client;
+}
+
+export function resetDbClient(): void {
+  if (_client && typeof (_client as any).close === "function") {
+    try {
+      (_client as any).close();
+    } catch {}
+  }
+  _client = null;
+  _activeDbPath = null;
+  _initializedPath = null;
 }
 
 // ── Provenance enum values (Decision D04) ────────────────────────
@@ -45,10 +63,12 @@ export type DbProvenance = (typeof PROVENANCE_ENUM)[number];
 
 // ── Migration init ────────────────────────────────────────────────
 
-let _initialized = false;
-
 export async function initDb(): Promise<void> {
-  if (_initialized) return;
+  const targetPath = process.env.IDEAPROBE_DB_PATH
+    ? path.resolve(process.env.IDEAPROBE_DB_PATH)
+    : DB_PATH;
+
+  if (_initializedPath === targetPath) return;
   const db = getDb();
   
   // Apply schema
@@ -159,7 +179,7 @@ export async function initDb(): Promise<void> {
       AND (result IS NULL OR TRIM(result) = '')
   `);
 
-  _initialized = true;
+  _initializedPath = targetPath;
 }
 
 // ── Schema DDL ────────────────────────────────────────────────────

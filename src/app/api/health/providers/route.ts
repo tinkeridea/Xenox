@@ -3,9 +3,14 @@ import { initDb, getDb, reseedDemoFixtures } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
 import { checkOllamaHealth } from "@/lib/ollama";
 import { checkTinyFishHealth } from "@/lib/tinyfish";
+import { delegateToFastAPI } from "@/lib/fastapiProxy";
 
-// GET /api/health/providers — Returns availability and configured model labels (no secrets)
-export async function GET(_req: NextRequest) {
+/**
+ * ROLLBACK PATH: Original TypeScript provider health check implementation.
+ * To rollback Slice 1AG delegation back to direct TypeScript execution:
+ * Replace `return await delegateToFastAPI(...)` in GET with `return await getProvidersHealthFromTs();`
+ */
+export async function getProvidersHealthFromTs() {
   let dbStatus = "healthy";
   let projectCount = 0;
 
@@ -54,6 +59,16 @@ export async function GET(_req: NextRequest) {
       ],
     },
   });
+}
+
+// GET /api/health/providers — Returns availability and configured model labels (no secrets)
+export async function GET(req: NextRequest) {
+  try {
+    return await delegateToFastAPI(req, "/api/health/providers", { timeoutMs: 6000 });
+  } catch (err: unknown) {
+    console.error("GET /api/health/providers proxy error:", err);
+    return apiError("INTERNAL_ERROR", "Failed to retrieve provider health status.", 500);
+  }
 }
 
 // POST /api/health/providers — Reseed demo fixtures idempotently for live rehearsal

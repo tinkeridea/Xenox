@@ -1,7 +1,7 @@
 import { NextRequest } from "next/server";
 import { initDb, getDb, nowUtc } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
-import { runInference, validateExperiment, EXPERIMENT_SCHEMA_DESC, type ExperimentSchema } from "@/lib/ollama";
+import { runInference, validateExperiment, EXPERIMENT_SCHEMA_DESC, isAiInference, type ExperimentSchema } from "@/lib/ollama";
 
 interface RouteParams {
   params: Promise<{ id: string }>;
@@ -48,6 +48,42 @@ const EXPERIMENT_FALLBACKS: ExperimentSchema[] = [
   },
 ];
 
+function buildLiveExperimentFallback(
+  projectTitle: string,
+  brief: { problem?: string; target_customer?: string; solution?: string } | undefined,
+  assumption: { id: string; statement: string; category: string; impact: string; uncertainty: string } | null,
+  requestedMethod?: string
+): ExperimentSchema {
+  const targetCohort = brief?.target_customer
+    ? `${brief.target_customer} (target n=30)`
+    : "Early adopter customer cohort (target n=30)";
+  const method = requestedMethod || "Concierge MVP / Direct Customer Outreach";
+
+  const hypothesis = assumption
+    ? `If we provide a concierge prototype of ${brief?.solution || projectTitle} to test "${assumption.statement}", at least 30% of ${brief?.target_customer || "target customers"} will complete the target workflow.`
+    : `If we offer early access to ${brief?.solution || projectTitle} addressing "${brief?.problem || 'the core problem'}", at least 25% of ${brief?.target_customer || "prospective users"} will commit to an initial trial.`;
+
+  return {
+    hypothesis,
+    method,
+    cohort: targetCohort,
+    metric: "Completed customer workflow / trial conversion rate",
+    threshold: ">= 30% positive conversion",
+    duration: "7 days",
+    cost_estimate: "$0 (manual concierge outreach)",
+    decision_rules: {
+      continue: "Conversion >= 30% with clear qualitative willingness to pay/use",
+      pivot: "Conversion 15-29% — conduct friction interviews on core blockers",
+      stop: "Conversion < 15% — re-evaluate problem urgency and target customer definition",
+    },
+    ethical_notes: [
+      "Explicit informed consent required from all student/user participants",
+      "No payment processed or sensitive personal credentials collected during concierge test",
+    ],
+    linked_assumption_ids: assumption ? [assumption.id] : [],
+  };
+}
+
 export async function POST(req: NextRequest, { params }: RouteParams) {
   try {
     await initDb();
@@ -56,13 +92,14 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
 
     // Verify project exists
     const projRes = await db.execute({
-      sql: "SELECT title FROM projects WHERE id = ?",
+      sql: "SELECT title, mode FROM projects WHERE id = ?",
       args: [id],
     });
     if (projRes.rows.length === 0) {
       return apiError("PROJECT_NOT_FOUND", `Project '${id}' not found.`, 404);
     }
-    const project = projRes.rows[0] as unknown as { title: string };
+    const project = projRes.rows[0] as unknown as { title: string; mode?: string };
+    const isDemoProject = id === "proj-study-planner" || project.mode === "DEMO";
 
     const body = await req.json().catch(() => ({}));
     const requestedAssumptionId: string = typeof body.assumptionId === "string" ? body.assumptionId.trim() : "";
@@ -131,10 +168,12 @@ Requirements:
 Return a JSON object conforming exactly to the schema.`;
 
     const fallbackIndex = Math.floor(Math.random() * EXPERIMENT_FALLBACKS.length);
-    const chosenFallback: ExperimentSchema = {
-      ...EXPERIMENT_FALLBACKS[fallbackIndex],
-      linked_assumption_ids: assumption ? [assumption.id] : [],
-    };
+    const chosenFallback: ExperimentSchema = isDemoProject
+      ? {
+          ...EXPERIMENT_FALLBACKS[fallbackIndex],
+          linked_assumption_ids: assumption ? [assumption.id] : [],
+        }
+      : buildLiveExperimentFallback(project.title, brief, assumption, requestedMethod);
 
     const outcome = await runInference<ExperimentSchema>({
       task: "experiment-planner",
@@ -146,6 +185,20 @@ Return a JSON object conforming exactly to the schema.`;
       fallbackProvenance: "SAMPLE",
     });
 
+    const isLive = isAiInference(outcome);
+
+    // For live customer projects, offline fallbacks are not permitted to masquerade as research or planning
+    if (!isDemoProject && !isLive) {
+      const reason = (outcome as { reason?: string }).reason || "Inference failed";
+      return apiError(
+        "INFERENCE_FAILED",
+        `Ollama local inference failed for live project '${id}': ${reason}. Fallbacks are not permitted for live customer experiment planning. Start Ollama and retry.`,
+        503,
+        true
+      );
+    }
+
+    const dbProvenance = isLive ? "AI_INFERENCE" : "SAMPLE";
     const exp = outcome.data;
     const now = nowUtc();
     const expId = `exp-ai-${Date.now().toString(36)}`;
@@ -173,7 +226,7 @@ Return a JSON object conforming exactly to the schema.`;
         exp.duration || "2 weeks",
         exp.cost_estimate || "$0",
         decisionRulesJson,
-        outcome.provenance,
+        dbProvenance,
         now,
       ],
     });
@@ -197,9 +250,15 @@ Return a JSON object conforming exactly to the schema.`;
     return apiSuccess({
       experiment: created.rows[0],
       linkedAssumption: assumption,
-      provenance: outcome.provenance,
-      latencyMs: outcome.provenance === "AI_INFERENCE" ? outcome.latencyMs : null,
-    }, outcome.provenance, 201);
+      provenance: dbProvenance,
+      latencyMs: isLive ? outcome.latencyMs : null,
+      inference: {
+        provenance: outcome.provenance,
+        latencyMs: isLive ? outcome.latencyMs : null,
+        reason: !isLive ? (outcome as any).reason : null,
+        fallbackAt: !isLive ? (outcome as any).fallbackAt : null,
+      },
+    }, dbProvenance, 201);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error("POST /api/projects/[id]/experiments/generate error:", msg);

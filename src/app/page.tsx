@@ -2,7 +2,7 @@
 
 import React, { useState } from "react";
 import Link from "next/link";
-import { ProvenanceBadge, FixtureBadge, StatusDot } from "@/components/Badges";
+import { ProvenanceBadge, StatusDot } from "@/components/Badges";
 import { DEMO_PROJECTS_LIST, DEMO_RUN } from "@/lib/mockData";
 import type { Project } from "@/types";
 
@@ -28,8 +28,8 @@ export default function DashboardPage() {
             geography: r.geography || "",
             stage: r.idea_stage || "Idea",
             status: r.status || "active",
-            mode: r.mode || "DEMO",
-            provenance: r.mode === "DEMO" ? "SAMPLE" : "USER_INPUT",
+            mode: r.mode || "LIVE",
+            provenance: (r.provenance as any) || (r.mode === "DEMO" ? "SAMPLE" : "USER_INPUT"),
             createdAt: r.created_at,
             updatedAt: r.updated_at,
           }));
@@ -96,7 +96,6 @@ export default function DashboardPage() {
             <h1 style={{ fontSize: "1.75rem", fontWeight: "700", color: "var(--text-primary)" }}>
               IdeaProbe Workspace
             </h1>
-            <FixtureBadge />
           </div>
           <p style={{ color: "var(--text-secondary)", marginTop: "var(--space-1)", fontSize: "0.9375rem" }}>
             Turn assumptions into falsifiable tests before committing code or capital.
@@ -176,7 +175,16 @@ export default function DashboardPage() {
             {projects.length}
           </div>
           <div style={{ fontSize: "0.75rem", color: "var(--text-secondary)", marginTop: "var(--space-1)" }}>
-            1 active demo fixture, 2 sample drafts
+            {(() => {
+              const demoCount = projects.filter((p) => p.mode === "DEMO").length;
+              const liveCount = projects.filter((p) => p.mode === "LIVE").length;
+              const parts: string[] = [];
+              if (demoCount > 0) parts.push(`${demoCount} demo fixture${demoCount === 1 ? "" : "s"}`);
+              if (liveCount > 0) parts.push(`${liveCount} live project${liveCount === 1 ? "" : "s"}`);
+              const otherCount = projects.length - demoCount - liveCount;
+              if (otherCount > 0) parts.push(`${otherCount} other`);
+              return parts.length > 0 ? parts.join(", ") : "No saved projects";
+            })()}
           </div>
         </div>
 
@@ -293,14 +301,14 @@ export default function DashboardPage() {
 
               <div className="flex gap-2">
                 <Link
-                  href={project.id === "proj-study-planner" ? "/overview" : `/runs/${project.id}`}
+                  href={`/overview?projectId=${encodeURIComponent(project.id)}`}
                   className="btn btn-secondary btn-sm"
                   style={{ fontSize: "0.8125rem" }}
                 >
                   Inspect Run Overview →
                 </Link>
                 <Link
-                  href="/report"
+                  href={`/report?projectId=${encodeURIComponent(project.id)}`}
                   className="btn btn-primary btn-sm"
                   style={{ fontSize: "0.8125rem" }}
                 >

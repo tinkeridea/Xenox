@@ -1,35 +1,46 @@
 import { NextRequest } from "next/server";
 import { initDb, getDb, nowUtc } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
+import { delegateToFastAPI } from "@/lib/fastapiProxy";
+import { reconcileProjectStages } from "@/lib/stageReconciliation";
 
 interface RouteParams {
   params: Promise<{ id: string }>;
 }
 
-// GET /api/projects/[id]/sources — List all sources for project
+/**
+ * ROLLBACK PATH: Original TypeScript SQLite GET implementation.
+ * To rollback Slice 1R delegation back to direct TypeScript execution:
+ * Replace `return await delegateToFastAPI(...)` in GET with `return getSourcesFromDb(id);`
+ */
+export async function getSourcesFromDb(id: string) {
+  await initDb();
+  const db = getDb();
+
+  const sourcesRes = await db.execute({
+    sql: `SELECT s.*, 
+            (SELECT COUNT(*) FROM evidence e WHERE e.source_id = s.id) as linked_evidence_count
+          FROM sources s
+          WHERE s.project_id = ?
+          ORDER BY s.created_at DESC`,
+    args: [id],
+  });
+
+  return apiSuccess({
+    projectId: id,
+    sources: sourcesRes.rows,
+  });
+}
+
+// GET /api/projects/[id]/sources — List all sources for project (Delegated to FastAPI via Slice 1R)
 export async function GET(req: NextRequest, { params }: RouteParams) {
   try {
-    await initDb();
     const { id } = await params;
-    const db = getDb();
-
-    const sourcesRes = await db.execute({
-      sql: `SELECT s.*, 
-              (SELECT COUNT(*) FROM evidence e WHERE e.source_id = s.id) as linked_evidence_count
-            FROM sources s
-            WHERE s.project_id = ?
-            ORDER BY s.created_at DESC`,
-      args: [id],
-    });
-
-    return apiSuccess({
-      projectId: id,
-      sources: sourcesRes.rows,
-    });
+    return await delegateToFastAPI(req, `/api/projects/${encodeURIComponent(id)}/sources`);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error("GET /api/projects/[id]/sources error:", msg);
-    return apiError("DB_QUERY_FAILED", msg, 500);
+    return apiError("INTERNAL_ERROR", "Failed to retrieve project sources.", 500);
   }
 }
 
@@ -75,6 +86,9 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       args: [sourceId, id, url, title, publisher, publishedAt, now, sourceType, provider, now],
     });
+
+    // Reconcile research stage with new source (Phase 3J)
+    await reconcileProjectStages(id);
 
     const createdSource = {
       id: sourceId,

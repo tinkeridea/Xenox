@@ -1,6 +1,8 @@
 import { NextRequest } from "next/server";
 import { initDb, getDb } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
+import { delegateToFastAPI } from "@/lib/fastapiProxy";
+import { reconcileProjectStages } from "@/lib/stageReconciliation";
 import {
   isPlaceholderEvidence,
   isPlaceholderSource,
@@ -18,32 +20,86 @@ import {
   formatCompetitorCategory,
   deduplicateCompetitors,
   getSemanticCompetitorKey,
+  isDifferentiated,
+  getDifferentiationMetrics,
+  buildDifferentiationMarkdownTable,
 } from "@/lib/competitorValidation";
+import { extractVerdictHeadline } from "@/lib/reportComparison";
 
 interface RouteParams {
   params: Promise<{ id: string }>;
 }
 
-// ── GET: Return the latest saved report snapshot ─────────────────
-export async function GET(req: NextRequest, { params }: RouteParams) {
+/**
+ * ROLLBACK PATH: Original TypeScript SQLite GET implementation.
+ * To rollback Slice 1AE delegation back to direct TypeScript execution:
+ * Replace `return await delegateToFastAPI(...)` in GET with `return await getReportFromDb(id);`
+ */
+export async function getReportFromDb(id: string, version?: number) {
   try {
     await initDb();
-    const { id } = await params;
     const db = getDb();
 
+    let sql = "SELECT * FROM report_snapshots WHERE project_id = ? ORDER BY version DESC LIMIT 1";
+    let args: any[] = [id];
+
+    if (typeof version === "number" && !isNaN(version)) {
+      if (version <= 0) {
+        return apiError(
+          "INVALID_VERSION",
+          `Invalid snapshot version '${version}'. Version must be a positive integer.`,
+          400
+        );
+      }
+      sql = "SELECT * FROM report_snapshots WHERE project_id = ? AND version = ?";
+      args = [id, version];
+    }
+
     const res = await db.execute({
-      sql: "SELECT * FROM report_snapshots WHERE project_id = ? ORDER BY version DESC LIMIT 1",
-      args: [id],
+      sql,
+      args,
     });
 
     if (res.rows.length === 0) {
-      return apiError("REPORT_NOT_FOUND", `No report snapshot found for project '${id}'.`, 404);
+      const msg = typeof version === "number"
+        ? `No report snapshot version '${version}' found for project '${id}'.`
+        : `No report snapshot found for project '${id}'.`;
+      return apiError("REPORT_NOT_FOUND", msg, 404);
     }
 
     const row: any = res.rows[0];
+    const manifest =
+      typeof row.provenance_manifest === "string"
+        ? JSON.parse(row.provenance_manifest)
+        : row.provenance_manifest;
     let content = typeof row.content === "string" ? JSON.parse(row.content) : row.content;
     if (Array.isArray(content)) {
       content = content.map((sec: any) => {
+        if (sec.id === "sec-sources") {
+          // Normalize legacy/v1 snapshots where sec-sources was erroneously stamped SAMPLE despite 0 sample items
+          if (
+            sec.provenance === "SAMPLE" &&
+            manifest &&
+            manifest.SAMPLE === 0 &&
+            (manifest.REAL_SOURCE || 0) > 0
+          ) {
+            return { ...sec, provenance: "REAL_SOURCE" };
+          }
+          return sec;
+        }
+        if (sec.id === "sec-experiments") {
+          // Normalize legacy snapshots where 0 experiments were designed and erroneously stamped AI_INFERENCE
+          if (
+            sec.provenance === "AI_INFERENCE" &&
+            typeof sec.content === "string" &&
+            sec.content.includes("No validation experiments have been designed yet") &&
+            manifest &&
+            (manifest.AI_INFERENCE || 0) === 0
+          ) {
+            return { ...sec, provenance: "USER_INPUT" };
+          }
+          return sec;
+        }
         if (sec.id === "sec-personas" && typeof sec.content === "string") {
           const blocks = sec.content.split("\n\n");
           const seenNames = new Set<string>();
@@ -144,18 +200,96 @@ export async function GET(req: NextRequest, { params }: RouteParams) {
     const report = {
       ...row,
       content,
-      provenance_manifest:
-        typeof row.provenance_manifest === "string"
-          ? JSON.parse(row.provenance_manifest)
-          : row.provenance_manifest,
+      provenance_manifest: manifest,
       contains_simulated: Boolean(row.contains_simulated),
       contains_sample: Boolean(row.contains_sample),
     };
 
     return apiSuccess({ projectId: id, report });
   } catch (err: any) {
-    console.error("GET /api/projects/[id]/report error:", err);
+    console.error("getReportFromDb error:", err);
     return apiError("DB_QUERY_FAILED", err.message, 500);
+  }
+}
+
+/**
+ * ROLLBACK PATH: Pure TypeScript SQLite report history list implementation.
+ */
+export async function getReportHistoryFromDb(id: string) {
+  try {
+    await initDb();
+    const db = getDb();
+
+    // Verify project exists
+    const projRes = await db.execute({
+      sql: "SELECT id FROM projects WHERE id = ?",
+      args: [id],
+    });
+    if (projRes.rows.length === 0) {
+      return apiError("PROJECT_NOT_FOUND", `Project '${id}' not found.`, 404);
+    }
+
+    const res = await db.execute({
+      sql: `SELECT id, project_id, run_id, version, generated_at,
+                   contains_simulated, contains_sample, provenance_manifest, content
+            FROM report_snapshots
+            WHERE project_id = ?
+            ORDER BY version DESC`,
+      args: [id],
+    });
+
+    const snapshots = res.rows.map((row: any) => {
+      const manifest =
+        typeof row.provenance_manifest === "string"
+          ? JSON.parse(row.provenance_manifest)
+          : (row.provenance_manifest || {});
+      const content =
+        typeof row.content === "string"
+          ? JSON.parse(row.content)
+          : (row.content || []);
+      const total_items = Object.values(manifest).reduce(
+        (a: number, b: any) => a + (Number(b) || 0),
+        0
+      );
+      const verdictSec = Array.isArray(content)
+        ? content.find((s: any) => s.id === "sec-verdict")
+        : null;
+      const verdict =
+        verdictSec && typeof verdictSec.content === "string"
+          ? extractVerdictHeadline(verdictSec.content)
+          : "Status Unknown";
+      const section_count = Array.isArray(content) ? content.length : 0;
+
+      return {
+        id: row.id,
+        project_id: row.project_id,
+        run_id: row.run_id,
+        version: row.version,
+        generated_at: row.generated_at,
+        contains_simulated: Boolean(row.contains_simulated),
+        contains_sample: Boolean(row.contains_sample),
+        provenance_manifest: manifest,
+        total_items,
+        verdict,
+        section_count,
+      };
+    });
+
+    return apiSuccess({ projectId: id, snapshots });
+  } catch (err: any) {
+    console.error("getReportHistoryFromDb error:", err);
+    return apiError("DB_QUERY_FAILED", err.message, 500);
+  }
+}
+
+// ── GET: Return the latest saved report snapshot ─────────────────
+export async function GET(req: NextRequest, { params }: RouteParams) {
+  try {
+    const { id } = await params;
+    return await delegateToFastAPI(req, `/api/projects/${encodeURIComponent(id)}/report`);
+  } catch (err: unknown) {
+    console.error("GET /api/projects/[id]/report proxy error:", err);
+    return apiError("INTERNAL_ERROR", "Failed to retrieve project report snapshot.", 500);
   }
 }
 
@@ -249,7 +383,7 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     // -- 3. Compute provenance manifest ───────────────────────────
     const allProvenance: string[] = [
       ...(brief ? [brief.provenance] : []),
-      ...sources.map((s: any) => s.provenance || "REAL_SOURCE"),
+      ...sources.map((s: any) => (isPlaceholderSource(s) ? "SAMPLE" : s.provenance || "REAL_SOURCE")),
       ...evidence.map((e: any) => e.provenance),
       ...personas.map((p: any) => p.provenance),
       ...insights.map((i: any) => i.provenance),
@@ -285,7 +419,12 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     const testedAssumptions = assumptions.filter((a) => a.status === "validated" || a.status === "invalidated");
 
     const completedExperiments = experiments.filter((e) => e.status === "completed");
-    const realResults = experiments.filter((e) => e.provenance === "REAL_EXPERIMENT_RESULT" || (e.result && e.result.length > 0));
+    const realResults = experiments.filter(
+      (e) =>
+        e.provenance === "REAL_EXPERIMENT_RESULT" &&
+        typeof e.result === "string" &&
+        e.result.trim().length > 0
+    );
 
     const sections = [
       {
@@ -300,9 +439,17 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
       {
         id: "sec-sources",
         title: "Research Sources & Evidence",
-        provenance: sources.some((s: any) => !isPlaceholderSource(s) && s.provenance === "REAL_SOURCE")
-          ? "REAL_SOURCE"
-          : "SAMPLE",
+        provenance: (() => {
+          const hasPlaceholder =
+            sources.some((s: any) => isPlaceholderSource(s)) ||
+            evidence.some((e: any) => isPlaceholderEvidence(e));
+          const hasReal =
+            sources.some((s: any) => !isPlaceholderSource(s)) ||
+            evidence.some((e: any) => e.provenance === "REAL_SOURCE" && !isPlaceholderEvidence(e));
+          if (hasPlaceholder) return "SAMPLE";
+          if (hasReal) return "REAL_SOURCE";
+          return "USER_INPUT";
+        })(),
         content: (() => {
           const realSources = sources.filter((s: any) => !isPlaceholderSource(s));
           const placeholderSources = sources.filter((s: any) => isPlaceholderSource(s));
@@ -416,9 +563,85 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
         })(),
       },
       {
+        id: "sec-differentiation",
+        title: "Competitor Differentiation Analysis",
+        provenance: (() => {
+          if (competitors.length === 0) return "USER_INPUT";
+          if (competitors.some((c: any) => c.provenance === "SAMPLE")) return "SAMPLE";
+          if (competitors.some((c: any) => c.provenance === "AI_INFERENCE")) return "AI_INFERENCE";
+          return competitors[0]?.provenance || "USER_INPUT";
+        })(),
+        content: (() => {
+          if (competitors.length === 0) {
+            return "No competitors or alternatives mapped for this project. Map market alternatives in the Alternatives module to evaluate competitive positioning and differentiation hypotheses.";
+          }
+          const diffMetrics = getDifferentiationMetrics(competitors);
+          const summary = [
+            `Differentiation Overview & Coverage:`,
+            `• Total Alternatives Mapped: ${diffMetrics.total}`,
+            `• Articulated Differentiators: ${diffMetrics.articulated}`,
+            `• Differentiation Gaps: ${diffMetrics.gaps}`,
+            `• Differentiation Coverage: ${diffMetrics.coveragePercent}%`,
+            "",
+            `Competitive Differentiation Breakdown:`,
+          ];
+
+          const itemLines = competitors.map((c: any, i: number) => {
+            const catLabel = formatCompetitorCategory(c.category);
+            const isDiff = isDifferentiated(c);
+            const statusLabel = isDiff ? "✓ ARTICULATED" : "⚠️ GAP — Unspecified";
+            const diffText = isDiff
+              ? c.differentiator.trim()
+              : "No distinct differentiation hypothesis articulated (unspecified or generic placeholder).";
+            const provTag = c.provenance === "SAMPLE"
+              ? " [Sample Demo Alternative]"
+              : c.provenance === "AI_INFERENCE"
+              ? " [AI Inference — Hypothesized Alternative]"
+              : ` [${c.provenance || "USER_INPUT"}]`;
+
+            return `${i + 1}. [${catLabel}] ${c.name}${provTag} — ${statusLabel}\n   • Current Solution: ${c.description || "No description provided."}\n   • Our Differentiation Advantage: ${diffText}`;
+          });
+
+          const markdownTable = buildDifferentiationMarkdownTable(competitors);
+
+          return `${summary.join("\n")}\n${itemLines.join("\n\n")}\n\nComparative Differentiation Grid:\n${markdownTable}`;
+        })(),
+        caveat: (() => {
+          if (competitors.length === 0) return null;
+          const caveats: string[] = [
+            "⚠️ STRATEGIC HYPOTHESIS NOTICE: An articulated differentiation claim represents a founder hypothesis, NOT validated customer preference or empirical market proof. A claimed advantage must be tested through customer discovery interviews and willingness-to-pay experiments before treating it as a true competitive moat.",
+          ];
+          if (competitors.some((c: any) => c.provenance === "SAMPLE")) {
+            caveats.push(
+              "⚠️ WARNING: Competitive landscape includes illustrative sample fixtures. These are demo placeholders and cannot be cited as real market intelligence or validated customer adoption."
+            );
+          }
+          if (competitors.some((c: any) => c.provenance === "AI_INFERENCE")) {
+            caveats.push(
+              "AI-generated differentiation hypotheses reflect model inferences and have not been validated against real customer purchase behavior."
+            );
+          }
+          return caveats.join(" ");
+        })(),
+        metrics: getDifferentiationMetrics(competitors),
+        items: competitors.map((c: any) => ({
+          id: c.id,
+          name: c.name,
+          category: c.category,
+          description: c.description || "",
+          differentiator: c.differentiator || "",
+          provenance: c.provenance || "USER_INPUT",
+          isDifferentiated: isDifferentiated(c),
+        })),
+      },
+      {
         id: "sec-experiments",
         title: "Validation Experiments & Results",
-        provenance: realResults.length > 0 ? "REAL_EXPERIMENT_RESULT" : "AI_INFERENCE",
+        provenance: realResults.length > 0
+          ? "REAL_EXPERIMENT_RESULT"
+          : experiments.length > 0
+          ? (experiments[0]?.provenance || "USER_INPUT")
+          : "USER_INPUT",
         content: experiments.length > 0
           ? `${experiments.length} experiment(s) designed.\n${completedExperiments.length} completed.\n${realResults.length} with real experiment results.\n\n${experiments
               .map((e: any, i: number) => {
@@ -475,6 +698,11 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
       ] as any[],
     });
 
+    // Reconcile report stage (Phase 3J)
+    await reconcileProjectStages(id);
+
+    const diffMetrics = getDifferentiationMetrics(competitors);
+
     return apiSuccess({
       projectId: id,
       report: {
@@ -498,6 +726,8 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
           competitors: competitors.length,
           mvp_features: mvpFeatures.length,
           real_experiment_results: realResults.length,
+          differentiated_competitors: diffMetrics.articulated,
+          differentiation_coverage_pct: diffMetrics.coveragePercent,
         },
       },
     }, "AI_INFERENCE", 201);
@@ -508,7 +738,7 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
 }
 
 // ── Verdict synthesizer ───────────────────────────────────────────
-function buildVerdict({
+export function buildVerdict({
   assumptions,
   experiments,
   realResults,
@@ -526,7 +756,38 @@ function buildVerdict({
   const criticalUntested = assumptions.filter(
     (a) => calcPriorityScore(a.uncertainty, a.impact) >= 6 && (a.status === "unvalidated" || a.status === "testing")
   ).length;
-  const hasRealData = realResults.length > 0 || sources.length > 0 || evidence.filter((e: any) => e.provenance === "REAL_SOURCE").length > 0;
+
+  const validRealResults = (realResults || []).filter(
+    (e: any) =>
+      e &&
+      e.provenance === "REAL_EXPERIMENT_RESULT" &&
+      typeof e.result === "string" &&
+      e.result.trim().length > 0
+  );
+
+  const realSources = (sources || []).filter(
+    (s: any) =>
+      s &&
+      !isPlaceholderSource(s) &&
+      s.provenance !== "SIMULATED" &&
+      s.provenance !== "SAMPLE" &&
+      s.provenance !== "AI_INFERENCE" &&
+      s.provenance !== "USER_INPUT" &&
+      s.source_type !== "user_input"
+  );
+
+  const realEvidence = (evidence || []).filter(
+    (e: any) =>
+      e &&
+      !isPlaceholderEvidence(e) &&
+      (e.provenance === "REAL_SOURCE" || isVerifiedRealEvidence(e)) &&
+      e.provenance !== "SIMULATED" &&
+      e.provenance !== "SAMPLE" &&
+      e.provenance !== "AI_INFERENCE" &&
+      e.provenance !== "USER_INPUT"
+  );
+
+  const hasRealData = validRealResults.length > 0 || realSources.length > 0 || realEvidence.length > 0;
 
   if (!hasRealData) {
     return `VALIDATION STATUS: ⛔ PRE-VALIDATION\n\nNo real customer data, experiment results, or verified sources have been collected. The idea is currently at the hypothesis stage.\n\nRequired next actions:\n1. Conduct ${criticalUntested} untested critical assumption interview(s) with real customers\n2. Execute the designed experiment(s) with measurable success criteria\n3. Replace all SIMULATED personas with real interview transcripts\n\nThe core premise has not been falsified yet, but it has also not been confirmed. Do not build until Experiment 1 passes its defined threshold.`;
@@ -536,9 +797,10 @@ function buildVerdict({
     return `VALIDATION STATUS: 🔴 HYPOTHESIS CHALLENGED\n\n${invalidatedAssumptions} assumption(s) have been invalidated vs ${validatedAssumptions} validated. The current direction requires a pivot or deeper investigation.\n\nReview invalidated assumptions and determine if the core problem statement still holds, or if a significant pivot is required.`;
   }
 
-  if (realResults.length > 0 && validatedAssumptions > 0) {
-    return `VALIDATION STATUS: 🟡 PARTIAL VALIDATION\n\n${realResults.length} real experiment result(s) recorded. ${validatedAssumptions} assumption(s) validated.\n\n${criticalUntested > 0 ? `${criticalUntested} critical/high assumptions still untested — continue validation before committing to full build.` : "All critical assumptions have been tested. Consider progressing to MVP build phase."}`;
+  if (validRealResults.length > 0 && validatedAssumptions > 0) {
+    return `VALIDATION STATUS: 🟡 PARTIAL VALIDATION\n\n${validRealResults.length} real experiment result(s) recorded. ${validatedAssumptions} assumption(s) validated.\n\n${criticalUntested > 0 ? `${criticalUntested} critical/high assumptions still untested — continue validation before committing to full build.` : "All critical assumptions have been tested. Consider progressing to MVP build phase."}`;
   }
 
   return `VALIDATION STATUS: 🟡 IN PROGRESS\n\nValidation pipeline is active. ${experiments.length} experiment(s) designed, ${validatedAssumptions} assumption(s) validated.\n\nContinue executing experiments and collecting real customer evidence before drawing conclusions.`;
 }
+

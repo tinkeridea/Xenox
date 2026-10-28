@@ -142,7 +142,7 @@ export function IdeaForm() {
           stage: values.stage,
           constraints: enrichedConstraints,
           goals: values.goals,
-          mode: "DEMO",
+          mode: "LIVE",
           provenance: "USER_INPUT",
         }),
       });

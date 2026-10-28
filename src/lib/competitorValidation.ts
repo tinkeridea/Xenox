@@ -113,3 +113,89 @@ export function deduplicateCompetitors<T extends {
 
   return Array.from(new Set(seenKeys.values()));
 }
+
+export interface DifferentiationMetrics {
+  total: number;
+  articulated: number;
+  gaps: number;
+  coveragePercent: number;
+}
+
+/**
+ * Checks whether a competitor has an articulated, meaningful differentiation hypothesis.
+ * Returns false if differentiator is missing, empty, or placeholder ('Not specified', 'none', 'n/a').
+ */
+export function isDifferentiated(item: { differentiator?: string | null }): boolean {
+  if (!item || typeof item.differentiator !== "string") return false;
+  const trimmed = item.differentiator.trim();
+  if (!trimmed) return false;
+  const lower = trimmed.toLowerCase();
+  if (
+    lower === "not specified." ||
+    lower === "not specified" ||
+    lower === "none" ||
+    lower === "none." ||
+    lower === "n/a" ||
+    lower === "tbd"
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Computes differentiation metrics and coverage statistics across a set of competitors.
+ */
+export function getDifferentiationMetrics(
+  items: Array<{ differentiator?: string | null }>
+): DifferentiationMetrics {
+  const total = items.length;
+  const articulated = items.filter(isDifferentiated).length;
+  const gaps = total - articulated;
+  const coveragePercent = total > 0 ? Math.round((articulated / total) * 100) : 0;
+  return { total, articulated, gaps, coveragePercent };
+}
+
+/**
+ * Formats a list of competitors into a clean, comparative Markdown Differentiation Grid table.
+ * Useful for founders copying competitive positioning into pitches, briefs, or validation logs.
+ */
+export function buildDifferentiationMarkdownTable(
+  items: Array<{
+    name: string;
+    category: string;
+    description?: string | null;
+    differentiator?: string | null;
+    provenance?: string;
+  }>
+): string {
+  if (!items || items.length === 0) {
+    return "_No competitors or alternatives mapped._";
+  }
+
+  const rows: string[] = [
+    "| Alternative | Category | Current Solution / Offer | Our Differentiation Advantage | Status | Provenance |",
+    "|---|---|---|---|---|---|",
+  ];
+
+  for (const c of items) {
+    const name = (c.name || "Unnamed").replace(/\|/g, "\\|");
+    const category = formatCompetitorCategory(c.category).replace(/\|/g, "\\|");
+    const desc = (c.description || "No description provided.")
+      .replace(/\|/g, "\\|")
+      .replace(/\r?\n/g, " ")
+      .trim();
+    const hasDiff = isDifferentiated(c);
+    const diff = (c.differentiator || "Not specified.")
+      .replace(/\|/g, "\\|")
+      .replace(/\r?\n/g, " ")
+      .trim();
+    const status = hasDiff ? "✓ Articulated" : "⚠️ Gap (Unspecified)";
+    const prov = (c.provenance || "USER_INPUT").replace(/\|/g, "\\|");
+
+    rows.push(`| **${name}** | ${category} | ${desc} | ${diff} | ${status} | \`${prov}\` |`);
+  }
+
+  return rows.join("\n");
+}
+

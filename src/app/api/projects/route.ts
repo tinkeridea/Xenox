@@ -1,42 +1,53 @@
 import { NextRequest } from "next/server";
 import { initDb, getDb, nowUtc, isValidProvenance } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
+import { delegateToFastAPI } from "@/lib/fastapiProxy";
 import { v4 as uuidv4 } from "uuid";
 
-// GET /api/projects — List all projects with brief summary & latest run
-export async function GET() {
+/**
+ * ROLLBACK PATH: Original TypeScript SQLite GET implementation.
+ * To rollback Slice 1X delegation back to direct TypeScript execution:
+ * Replace `return await delegateToFastAPI(...)` in GET with `return getProjectsFromDb();`
+ */
+export async function getProjectsFromDb() {
+  await initDb();
+  const db = getDb();
+
+  const query = `
+    SELECT 
+      p.id,
+      p.title,
+      p.mode,
+      p.status,
+      p.created_at,
+      p.updated_at,
+      b.problem,
+      b.target_customer,
+      b.solution,
+      b.category,
+      b.stage as idea_stage,
+      b.geography,
+      (SELECT r.id FROM runs r WHERE r.project_id = p.id ORDER BY r.created_at DESC LIMIT 1) as latest_run_id,
+      (SELECT r.status FROM runs r WHERE r.project_id = p.id ORDER BY r.created_at DESC LIMIT 1) as latest_run_status
+    FROM projects p
+    LEFT JOIN idea_briefs b ON b.project_id = p.id AND b.version = (
+      SELECT MAX(version) FROM idea_briefs WHERE project_id = p.id
+    )
+    ORDER BY p.updated_at DESC
+  `;
+
+  const res = await db.execute(query);
+  return apiSuccess(res.rows, "MIXED");
+}
+
+// GET /api/projects — List all projects with brief summary & latest run (Delegated to FastAPI via Slice 1X)
+export async function GET(req: NextRequest) {
   try {
-    await initDb();
-    const db = getDb();
-
-    const query = `
-      SELECT 
-        p.id,
-        p.title,
-        p.mode,
-        p.status,
-        p.created_at,
-        p.updated_at,
-        b.problem,
-        b.target_customer,
-        b.solution,
-        b.category,
-        b.stage as idea_stage,
-        b.geography,
-        (SELECT r.id FROM runs r WHERE r.project_id = p.id ORDER BY r.created_at DESC LIMIT 1) as latest_run_id,
-        (SELECT r.status FROM runs r WHERE r.project_id = p.id ORDER BY r.created_at DESC LIMIT 1) as latest_run_status
-      FROM projects p
-      LEFT JOIN idea_briefs b ON b.project_id = p.id AND b.version = (
-        SELECT MAX(version) FROM idea_briefs WHERE project_id = p.id
-      )
-      ORDER BY p.updated_at DESC
-    `;
-
-    const res = await db.execute(query);
-    return apiSuccess(res.rows, "MIXED");
-  } catch (err: any) {
-    console.error("GET /api/projects error:", err);
-    return apiError("DB_QUERY_FAILED", err.message || "Failed to fetch projects", 500);
+    return await delegateToFastAPI(req, "/api/projects");
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("GET /api/projects error:", msg);
+    return apiError("INTERNAL_ERROR", "Failed to retrieve projects.", 500);
   }
 }
 
@@ -58,7 +69,7 @@ export async function POST(req: NextRequest) {
       stage = "Idea",
       constraints = "",
       goals = "",
-      mode = "DEMO",
+      mode = "LIVE",
       provenance = "USER_INPUT",
     } = body;
 
