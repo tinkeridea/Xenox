@@ -19,6 +19,7 @@
 import { NextRequest } from "next/server";
 import { v4 as uuidv4 } from "uuid";
 import { apiError } from "@/lib/apiResponse";
+import { isPresentationDemoMode, getPresentationDemoFixture } from "@/lib/presentationMode";
 
 export const FASTAPI_ORIGIN = "http://127.0.0.1:8000";
 export const PROXY_TIMEOUT_MS = 5000;
@@ -147,6 +148,14 @@ export async function delegateToFastAPI(
 ): Promise<Response> {
   const method = (req.method || "GET").toUpperCase();
   const allowed = options.allowedMethods || ["GET"];
+
+  // Step 0: In presentation demo mode, serve safe immutable fixtures directly
+  if (isPresentationDemoMode()) {
+    const fixture = getPresentationDemoFixture(trustedPath, req.url);
+    if (fixture) {
+      return fixture;
+    }
+  }
 
   // Step 1: Enforce GET-only allowlist (Slice 1R constraint)
   if (method !== "GET" || !allowed.includes(method)) {

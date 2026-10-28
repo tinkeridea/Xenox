@@ -2,6 +2,7 @@ import { NextRequest } from "next/server";
 import { initDb, getDb } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
 import { reconcileProjectStages } from "@/lib/stageReconciliation";
+import { isPresentationDemoMode, getPresentationDemoFixture } from "@/lib/presentationMode";
 
 interface RouteParams {
   params: Promise<{ id: string }>;
@@ -9,6 +10,13 @@ interface RouteParams {
 
 // GET /api/runs/[id] — Fetch run details and stage progression
 export async function GET(req: NextRequest, { params }: RouteParams) {
+  if (isPresentationDemoMode()) {
+    const { id } = await params;
+    const fixture = getPresentationDemoFixture(`/api/runs/${encodeURIComponent(id)}`);
+    if (fixture) return fixture;
+    return apiError("RUN_NOT_FOUND", `Run '${id}' not found.`, 404);
+  }
+
   try {
     await initDb();
     const { id } = await params;

@@ -2,6 +2,7 @@ import { NextRequest } from "next/server";
 import { initDb, getDb, nowUtc } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
 import { reconcileProjectStages } from "@/lib/stageReconciliation";
+import { isPresentationDemoMode, presentationReadOnlyResponse } from "@/lib/presentationMode";
 import {
   runInference,
   validatePersonaChat,
@@ -44,6 +45,10 @@ function getFixtureReply(personaId: string, message: string): string {
 }
 
 export async function POST(req: NextRequest, { params }: RouteParams) {
+  if (isPresentationDemoMode()) {
+    return presentationReadOnlyResponse();
+  }
+
   try {
     await initDb();
     const { id } = await params;

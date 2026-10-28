@@ -4,6 +4,7 @@ import { apiSuccess, apiError } from "@/lib/apiResponse";
 import { checkOllamaHealth } from "@/lib/ollama";
 import { checkTinyFishHealth } from "@/lib/tinyfish";
 import { delegateToFastAPI } from "@/lib/fastapiProxy";
+import { isPresentationDemoMode, presentationReadOnlyResponse } from "@/lib/presentationMode";
 
 /**
  * ROLLBACK PATH: Original TypeScript provider health check implementation.
@@ -73,6 +74,10 @@ export async function GET(req: NextRequest) {
 
 // POST /api/health/providers — Reseed demo fixtures idempotently for live rehearsal
 export async function POST(req: NextRequest) {
+  if (isPresentationDemoMode()) {
+    return presentationReadOnlyResponse();
+  }
+
   try {
     await initDb();
     const body = await req.json().catch(() => ({}));

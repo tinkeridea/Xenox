@@ -3,6 +3,7 @@ import { initDb, getDb, nowUtc, isValidProvenance } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
 import { delegateToFastAPI } from "@/lib/fastapiProxy";
 import { v4 as uuidv4 } from "uuid";
+import { isPresentationDemoMode, presentationReadOnlyResponse } from "@/lib/presentationMode";
 
 /**
  * ROLLBACK PATH: Original TypeScript SQLite GET implementation.
@@ -53,6 +54,10 @@ export async function GET(req: NextRequest) {
 
 // POST /api/projects — Create project + versioned IdeaBrief
 export async function POST(req: NextRequest) {
+  if (isPresentationDemoMode()) {
+    return presentationReadOnlyResponse();
+  }
+
   try {
     await initDb();
     const db = getDb();

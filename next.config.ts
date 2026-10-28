@@ -5,6 +5,19 @@ const nextConfig: NextConfig = {
   cacheComponents: true,
   partialPrefetching: true,
   async rewrites() {
+    const isDemoMode =
+      process.env.APP_MODE === "demo" ||
+      process.env.NEXT_PUBLIC_DEMO_MODE === "true" ||
+      Boolean(process.env.VERCEL);
+
+    if (isDemoMode) {
+      return {
+        beforeFiles: [],
+        afterFiles: [],
+        fallback: [],
+      };
+    }
+
     return {
       beforeFiles: [
         // Dedicated diagnostic proxy for provider health (Slice 1B / Decision D26).

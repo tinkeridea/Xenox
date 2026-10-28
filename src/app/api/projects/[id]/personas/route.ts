@@ -1,12 +1,20 @@
 import { NextRequest } from "next/server";
 import { initDb, getDb } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
+import { isPresentationDemoMode, getPresentationDemoFixture } from "@/lib/presentationMode";
 
 interface RouteParams {
   params: Promise<{ id: string }>;
 }
 
 export async function GET(req: NextRequest, { params }: RouteParams) {
+  if (isPresentationDemoMode()) {
+    const { id } = await params;
+    const fixture = getPresentationDemoFixture(`/api/projects/${encodeURIComponent(id)}/personas`);
+    if (fixture) return fixture;
+    return apiError("PROJECT_NOT_FOUND", `Project '${id}' not found.`, 404);
+  }
+
   try {
     await initDb();
     const { id } = await params;

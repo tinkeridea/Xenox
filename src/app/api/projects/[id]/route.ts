@@ -3,6 +3,7 @@ import { initDb, getDb, nowUtc } from "@/lib/db";
 import { apiSuccess, apiError } from "@/lib/apiResponse";
 import { delegateToFastAPI } from "@/lib/fastapiProxy";
 import { reconcileProjectStages } from "@/lib/stageReconciliation";
+import { isPresentationDemoMode, presentationReadOnlyResponse } from "@/lib/presentationMode";
 
 interface RouteParams {
   params: Promise<{ id: string }>;
@@ -80,6 +81,10 @@ export async function GET(req: NextRequest, { params }: RouteParams) {
 
 // PATCH /api/projects/[id]
 export async function PATCH(req: NextRequest, { params }: RouteParams) {
+  if (isPresentationDemoMode()) {
+    return presentationReadOnlyResponse();
+  }
+
   try {
     await initDb();
     const { id } = await params;
@@ -196,6 +201,10 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
 
 // DELETE /api/projects/[id] — Cascade delete (Decision D08)
 export async function DELETE(req: NextRequest, { params }: RouteParams) {
+  if (isPresentationDemoMode()) {
+    return presentationReadOnlyResponse();
+  }
+
   try {
     await initDb();
     const { id } = await params;

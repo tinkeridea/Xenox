@@ -16,8 +16,12 @@ import fs from "fs";
 
 // ── DB file path ──────────────────────────────────────────────────
 const DATA_DIR = path.join(process.cwd(), ".ideaprobe-data");
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+try {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+} catch {
+  // Ignored in read-only / serverless environments (e.g. Vercel)
 }
 const DB_PATH = path.join(DATA_DIR, "ideaprobe.db");
 
@@ -27,6 +31,18 @@ let _activeDbPath: string | null = null;
 let _initializedPath: string | null = null;
 
 export function getDb(): Client {
+  if (
+    process.env.APP_MODE === "demo" ||
+    process.env.NEXT_PUBLIC_DEMO_MODE === "true" ||
+    Boolean(process.env.VERCEL)
+  ) {
+    if (!_client || _activeDbPath !== ":memory:") {
+      _client = createClient({ url: ":memory:" });
+      _activeDbPath = ":memory:";
+    }
+    return _client;
+  }
+
   const targetPath = process.env.IDEAPROBE_DB_PATH
     ? path.resolve(process.env.IDEAPROBE_DB_PATH)
     : DB_PATH;
